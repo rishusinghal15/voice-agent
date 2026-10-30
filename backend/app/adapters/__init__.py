@@ -1,5 +1,7 @@
 """Adapters package for voice pipeline components."""
 
+from backend.app.adapters.llm_groq import GroqLLMAdapter
+from backend.app.adapters.llm_mock import MockLLMAdapter
 from backend.app.adapters.protocols import (
     Done,
     LLMAdapter,
@@ -19,6 +21,22 @@ from backend.app.adapters.protocols import (
     VADEventType,
     VADProcessor,
 )
+from backend.app.adapters.registry import (
+    UnknownProviderError,
+    get_llm_adapter,
+    get_stt_adapter,
+    get_tts_adapter,
+    get_vad_adapter,
+    register_llm,
+    register_stt,
+    register_tts,
+    register_vad,
+    validate_providers,
+)
+from backend.app.adapters.stt_deepgram import DeepgramSTTAdapter
+from backend.app.adapters.stt_mock import MockSTTAdapter, MockSTTStream
+from backend.app.adapters.tts_mock import MockTTSAdapter
+from backend.app.adapters.vad_mock import MockVADProcessor
 
 __all__ = [
     "VADEventType",
@@ -38,5 +56,21 @@ __all__ = [
     "LLMAdapter",
     "TTSAdapter",
     "Tool",
+    "MockVADProcessor",
+    "MockSTTStream",
+    "MockSTTAdapter",
+    "MockLLMAdapter",
+    "MockTTSAdapter",
+    "GroqLLMAdapter",
+    "DeepgramSTTAdapter",
+    "UnknownProviderError",
+    "register_vad",
+    "register_stt",
+    "register_llm",
+    "register_tts",
+    "get_vad_adapter",
+    "get_stt_adapter",
+    "get_llm_adapter",
+    "get_tts_adapter",
+    "validate_providers",
 ]
-

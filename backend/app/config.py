@@ -15,7 +15,7 @@ ENV_FILE = ROOT_DIR / ".env"
 
 
 class Settings(BaseSettings):
-    """Application settings with defaults from design §10."""
+    """Application settings with defaults from design §10 and task specifications."""
 
     model_config = SettingsConfigDict(
         env_file=(str(ENV_FILE), ".env"),
@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # System & Prompt Configuration
     SYSTEM_PROMPT: str = "You are a helpful voice assistant."
     PROMPT_VERSION: str = "v1.0"
+    FALLBACK_LINE: str = "Sorry, I didn't catch that, could you repeat?"
 
     # VAD Configuration
     VAD_SILENCE_MS: int = 600
@@ -37,11 +38,13 @@ class Settings(BaseSettings):
     STT_TIMEOUT_S: float = 3.0
     LLM_TIMEOUT_S: float = 5.0
     TTS_TIMEOUT_S: float = 5.0
+    TOOL_TIMEOUT_S: float = 5.0
 
-    # Provider Selection
-    STT_PROVIDER: str = "deepgram"
-    LLM_PROVIDER: str = "groq"
-    TTS_PROVIDER: str = "piper"
+    # Provider Selection (defaults to mock per Task P2)
+    VAD_PROVIDER: str = "mock"
+    STT_PROVIDER: str = "mock"
+    LLM_PROVIDER: str = "mock"
+    TTS_PROVIDER: str = "mock"
 
     # Per-provider API Keys
     GROQ_API_KEY: Optional[str] = None
@@ -63,4 +66,3 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
-

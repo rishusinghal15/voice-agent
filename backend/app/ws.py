@@ -5,10 +5,12 @@ Follows design doc §6:
 - Rejects unknown session IDs
 - Accepts binary PCM frames and JSON text frames
 - Handles ping -> pong
-- ECHO mode: buffers received PCM, sends back agent_audio_start, binary chunks,
-  agent_audio_end, and call_ended {reason: "user_end"} on end_call.
-- Every server JSON message includes ts (epoch ms).
+- Runs VoicePipeline for real-time VAD, STT, LLM, TTS, tools, metrics, and persistence
+- Supports echo mode (?echo=true) for M1 audio loopback testing
+- Every server JSON message includes ts (epoch ms)
 """
+
+from __future__ import annotations
 
 import json
 import time
@@ -17,6 +19,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from backend.app import db
+from backend.app.pipeline import VoicePipeline
 from backend.app.session import Session, SessionEvent, SessionState
 
 router = APIRouter()
@@ -38,6 +41,8 @@ async def send_json_message(websocket: WebSocket, payload: Dict[str, Any]) -> No
 async def websocket_voice_endpoint(
     websocket: WebSocket,
     session_id: Optional[str] = None,
+    mode: Optional[str] = None,
+    echo: bool = False,
 ) -> None:
     """Handle real-time voice streaming WebSocket connection."""
     # Reject connection if session_id is missing
@@ -60,24 +65,130 @@ async def websocket_voice_endpoint(
     # Accept WebSocket connection
     await websocket.accept()
 
-    # Initialize session state machine
-    session = Session(session_id=session_id)
-    session.transition(SessionEvent.SESSION_START)
+    # M1 ECHO mode fallback if requested
+    if echo or mode == "echo":
+        session = Session(session_id=session_id)
+        session.transition(SessionEvent.SESSION_START)
 
-    # Send initial state event to client
-    await send_json_message(
-        websocket,
-        {
-            "type": "state",
-            "state": session.state.value,
-        },
+        await send_json_message(
+            websocket,
+            {
+                "type": "state",
+                "state": session.state.value,
+            },
+        )
+
+        pcm_buffer = bytearray()
+        turn_id = 1
+        sentence_index = 0
+        sample_rate = 16000
+
+        try:
+            while True:
+                message = await websocket.receive()
+                msg_type = message.get("type")
+
+                if msg_type == "websocket.disconnect":
+                    break
+
+                if "bytes" in message and message["bytes"] is not None:
+                    pcm_chunk = message["bytes"]
+                    if pcm_chunk:
+                        pcm_buffer.extend(pcm_chunk)
+                    continue
+
+                if "text" in message and message["text"] is not None:
+                    raw_text = message["text"]
+                    try:
+                        data = json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        await send_json_message(
+                            websocket,
+                            {
+                                "type": "error",
+                                "code": "BAD_JSON",
+                                "message": "Malformed JSON frame received",
+                                "recoverable": True,
+                            },
+                        )
+                        continue
+
+                    client_type = data.get("type")
+
+                    if client_type == "ping":
+                        await send_json_message(websocket, {"type": "pong"})
+                        continue
+
+                    if client_type == "end_call":
+                        session.state = SessionState.SPEAKING
+                        await send_json_message(
+                            websocket,
+                            {
+                                "type": "state",
+                                "state": session.state.value,
+                            },
+                        )
+                        await send_json_message(
+                            websocket,
+                            {
+                                "type": "agent_audio_start",
+                                "turn_id": turn_id,
+                                "sentence_index": sentence_index,
+                                "sample_rate": sample_rate,
+                                "encoding": "pcm_s16le",
+                                "channels": 1,
+                            },
+                        )
+
+                        chunk_size = 640
+                        if len(pcm_buffer) > 0:
+                            for i in range(0, len(pcm_buffer), chunk_size):
+                                chunk = bytes(pcm_buffer[i : i + chunk_size])
+                                await websocket.send_bytes(chunk)
+
+                        await send_json_message(
+                            websocket,
+                            {
+                                "type": "agent_audio_end",
+                                "turn_id": turn_id,
+                                "sentence_index": sentence_index,
+                            },
+                        )
+
+                        try:
+                            session.transition(SessionEvent.END_CALL)
+                        except Exception:
+                            session.state = SessionState.ENDED
+
+                        await send_json_message(
+                            websocket,
+                            {
+                                "type": "call_ended",
+                                "reason": "user_end",
+                            },
+                        )
+
+                        await db.end_session(session_id=session_id, end_reason="user_end")
+                        await websocket.close()
+                        return
+        except WebSocketDisconnect:
+            pass
+        finally:
+            if session.state != SessionState.ENDED:
+                try:
+                    session.transition(SessionEvent.WS_DROP)
+                except Exception:
+                    session.state = SessionState.ENDED
+                await db.end_session(session_id=session_id, end_reason="ws_drop")
+        return
+
+    # Real-time Voice Pipeline mode (default)
+    pipeline = VoicePipeline(
+        session_id=session_id,
+        emit_json=lambda payload: send_json_message(websocket, payload),
+        emit_audio=lambda chunk: websocket.send_bytes(chunk),
     )
-
-    # Buffer for PCM audio frames in ECHO mode
-    pcm_buffer = bytearray()
-    turn_id = 1
-    sentence_index = 0
-    sample_rate = 16000
+    await pipeline.start()
 
     try:
         while True:
@@ -87,14 +198,14 @@ async def websocket_voice_endpoint(
             if msg_type == "websocket.disconnect":
                 break
 
-            # Handle binary PCM frames
+            # Handle binary PCM audio frames
             if "bytes" in message and message["bytes"] is not None:
                 pcm_chunk = message["bytes"]
                 if pcm_chunk:
-                    pcm_buffer.extend(pcm_chunk)
+                    await pipeline.handle_audio(pcm_chunk)
                 continue
 
-            # Handle JSON text frames
+            # Handle JSON text control frames
             if "text" in message and message["text"] is not None:
                 raw_text = message["text"]
                 try:
@@ -113,79 +224,31 @@ async def websocket_voice_endpoint(
 
                 client_type = data.get("type")
 
-                # Handle ping -> pong keepalive
                 if client_type == "ping":
-                    await send_json_message(websocket, {"type": "pong"})
+                    await pipeline.handle_ping()
                     continue
 
-                # Handle end_call -> Trigger ECHO playback and close
+                if client_type == "interrupt":
+                    await pipeline.handle_interrupt(
+                        turn_id=data.get("turn_id"),
+                        played_ms=data.get("played_ms", 0.0),
+                    )
+                    continue
+
+                if client_type == "playback_done":
+                    await pipeline.handle_playback_done(
+                        turn_id=data.get("turn_id"),
+                    )
+                    continue
+
                 if client_type == "end_call":
-                    # Step 1: Transition to SPEAKING and announce agent audio
-                    session.state = SessionState.SPEAKING
-                    await send_json_message(
-                        websocket,
-                        {
-                            "type": "state",
-                            "state": session.state.value,
-                        },
-                    )
-                    await send_json_message(
-                        websocket,
-                        {
-                            "type": "agent_audio_start",
-                            "turn_id": turn_id,
-                            "sentence_index": sentence_index,
-                            "sample_rate": sample_rate,
-                            "encoding": "pcm_s16le",
-                            "channels": 1,
-                        },
-                    )
-
-                    # Step 2: Stream back buffered binary PCM chunks (640 bytes = 20ms frames)
-                    chunk_size = 640
-                    if len(pcm_buffer) > 0:
-                        for i in range(0, len(pcm_buffer), chunk_size):
-                            chunk = bytes(pcm_buffer[i : i + chunk_size])
-                            await websocket.send_bytes(chunk)
-
-                    # Step 3: Announce audio end
-                    await send_json_message(
-                        websocket,
-                        {
-                            "type": "agent_audio_end",
-                            "turn_id": turn_id,
-                            "sentence_index": sentence_index,
-                        },
-                    )
-
-                    # Step 4: Announce call ended with reason "user_end"
-                    try:
-                        session.transition(SessionEvent.END_CALL)
-                    except Exception:
-                        session.state = SessionState.ENDED
-                    await send_json_message(
-                        websocket,
-                        {
-                            "type": "call_ended",
-                            "reason": "user_end",
-                        },
-                    )
-
-                    # Persist session end in database
-                    await db.end_session(session_id=session_id, end_reason="user_end")
-
-                    # Gracefully close socket
+                    await pipeline.handle_end_call(reason="user_end")
                     await websocket.close()
                     return
 
     except WebSocketDisconnect:
         pass
+    except Exception:
+        pass
     finally:
-        # If connection dropped without end_call, persist ws_drop
-        if session.state != SessionState.ENDED:
-            try:
-                session.transition(SessionEvent.WS_DROP)
-            except Exception:
-                session.state = SessionState.ENDED
-            await db.end_session(session_id=session_id, end_reason="ws_drop")
-
+        await pipeline.close(reason="ws_drop")

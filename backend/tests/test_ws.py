@@ -11,6 +11,7 @@ Follows design doc §6 and assignment M1 requirements:
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -80,8 +81,8 @@ def test_ws_echo_mode_on_end_call():
     res = client.post("/sessions")
     session_id = res.json()["session_id"]
 
-    # 2. Connect
-    with client.websocket_connect(f"/ws/voice?session_id={session_id}") as ws:
+    # 2. Connect (explicitly testing M1 echo mode)
+    with client.websocket_connect(f"/ws/voice?session_id={session_id}&echo=true") as ws:
         # Receive initial state
         state_msg = ws.receive_json()
         assert state_msg["type"] == "state"
@@ -161,3 +162,91 @@ def test_ws_disconnect_records_ws_drop():
     details = detail_res.json()
     assert details["session"]["end_reason"] == "ws_drop"
     assert details["session"]["ended_at"] is not None
+
+
+def test_ws_pipeline_end_call():
+    """Verify client sending end_call cleanly closes pipeline and session."""
+    client = TestClient(app)
+
+    res = client.post("/sessions")
+    session_id = res.json()["session_id"]
+
+    with client.websocket_connect(f"/ws/voice?session_id={session_id}") as ws:
+        state_msg = ws.receive_json()
+        assert state_msg["type"] == "state"
+        assert state_msg["state"] == "listening"
+
+        # Send end_call
+        ws.send_text(json.dumps({"type": "end_call"}))
+
+        ended_msg = ws.receive_json()
+        assert ended_msg["type"] == "call_ended"
+        assert ended_msg["reason"] == "user_end"
+
+    # DB verified
+    detail_res = client.get(f"/sessions/{session_id}")
+    assert detail_res.json()["session"]["end_reason"] == "user_end"
+
+
+def test_ws_pipeline_speech_turn():
+    """Verify full pipeline interaction through real WebSocket endpoint."""
+    client = TestClient(app)
+
+    res = client.post("/sessions")
+    session_id = res.json()["session_id"]
+
+    # Use 0 min speech duration for test so instantaneous frames pass VAD
+    settings.VAD_MIN_SPEECH_MS = 0
+
+    with client.websocket_connect(f"/ws/voice?session_id={session_id}") as ws:
+        # 1. State: listening
+        init_state = ws.receive_json()
+        assert init_state["type"] == "state"
+        assert init_state["state"] == "listening"
+
+        # 2. Send loud audio frames (RMS > 500)
+        loud_chunk = (b"\xff\x7f" * 160) + (b"\x00\x80" * 160)
+        for _ in range(5):
+            ws.send_bytes(loud_chunk)
+            time.sleep(0.01)
+
+        # 3. Send silent audio frame (RMS = 0)
+        silent_chunk = b"\x00\x00" * 320
+        ws.send_bytes(silent_chunk)
+
+        # 4. Receive events
+        events_received = []
+        audio_chunks_received = 0
+
+        # Collect events until turn_done
+        while True:
+            raw = ws.receive()
+            if "bytes" in raw and raw["bytes"] is not None:
+                audio_chunks_received += 1
+            elif "text" in raw and raw["text"] is not None:
+                msg = json.loads(raw["text"])
+                events_received.append(msg)
+                if msg.get("type") == "turn_done":
+                    break
+
+        event_types = [e["type"] for e in events_received]
+        assert "transcript_final" in event_types
+        assert "agent_text" in event_types
+        assert "turn_done" in event_types
+        assert audio_chunks_received > 0
+
+        # 5. Send playback_done
+        ws.send_text(json.dumps({"type": "playback_done", "turn_id": 1}))
+
+        # State should transition back to listening
+        listening_msg = ws.receive_json()
+        assert listening_msg["type"] == "state"
+        assert listening_msg["state"] == "listening"
+
+        # 6. End call
+        ws.send_text(json.dumps({"type": "end_call"}))
+        ended_msg = ws.receive_json()
+        assert ended_msg["type"] == "call_ended"
+
+    settings.VAD_MIN_SPEECH_MS = 250
+

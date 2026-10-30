@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from backend.app.adapters.registry import validate_providers
 from backend.app.api import router as api_router
 from backend.app.config import settings
 from backend.app.db import init_db
@@ -23,6 +24,8 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan context manager for startup and shutdown hooks."""
+    # Validate adapter providers configured in settings
+    validate_providers()
     # Initialize SQLite database tables on startup
     await init_db(settings.DB_PATH)
     yield
