@@ -30,11 +30,13 @@ class GroqLLMAdapter:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "llama-3.3-70b-versatile",
+        model: Optional[str] = None,
         base_url: str = "https://api.groq.com/openai/v1",
     ) -> None:
-        self.api_key: str = api_key or settings.GROQ_API_KEY or ""
-        self.model: str = model
+        self.api_key: str = (
+            api_key if api_key is not None else (settings.GROQ_API_KEY or "")
+        )
+        self.model: str = model or settings.GROQ_MODEL or "qwen/qwen3.8-27b"
         self.base_url: str = base_url.rstrip("/")
 
     async def stream(

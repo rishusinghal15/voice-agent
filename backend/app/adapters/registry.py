@@ -109,6 +109,28 @@ register_stt("mock", lambda: MockSTTAdapter())
 register_llm("mock", lambda: MockLLMAdapter())
 register_tts("mock", lambda: MockTTSAdapter())
 
+# Register local model providers
+def _silero_factory() -> VADProcessor:
+    from backend.app.adapters.vad_silero import SileroVADProcessor
+    return SileroVADProcessor()
+
+def _webrtc_factory() -> VADProcessor:
+    from backend.app.adapters.vad_webrtc import WebRTCVADProcessor
+    return WebRTCVADProcessor()
+
+def _vosk_factory() -> STTAdapter:
+    from backend.app.adapters.stt_vosk import VoskSTTAdapter
+    return VoskSTTAdapter()
+
+def _piper_factory() -> TTSAdapter:
+    from backend.app.adapters.tts_piper import PiperTTSAdapter
+    return PiperTTSAdapter()
+
+register_vad("silero", _silero_factory)
+register_vad("webrtc", _webrtc_factory)
+register_stt("vosk", _vosk_factory)
+register_tts("piper", _piper_factory)
+
 # Register cloud providers
 from backend.app.adapters.llm_groq import GroqLLMAdapter
 from backend.app.adapters.stt_deepgram import DeepgramSTTAdapter

@@ -35,8 +35,12 @@ from backend.app.adapters.registry import (
 )
 from backend.app.adapters.stt_deepgram import DeepgramSTTAdapter
 from backend.app.adapters.stt_mock import MockSTTAdapter, MockSTTStream
+from backend.app.adapters.stt_vosk import VoskSTTAdapter, VoskSTTStream
 from backend.app.adapters.tts_mock import MockTTSAdapter
+from backend.app.adapters.tts_piper import PiperTTSAdapter
 from backend.app.adapters.vad_mock import MockVADProcessor
+from backend.app.adapters.vad_silero import SileroVADProcessor
+from backend.app.adapters.vad_webrtc import WebRTCVADProcessor
 
 __all__ = [
     "VADEventType",
@@ -61,8 +65,13 @@ __all__ = [
     "MockSTTAdapter",
     "MockLLMAdapter",
     "MockTTSAdapter",
+    "PiperTTSAdapter",
     "GroqLLMAdapter",
     "DeepgramSTTAdapter",
+    "VoskSTTAdapter",
+    "VoskSTTStream",
+    "SileroVADProcessor",
+    "WebRTCVADProcessor",
     "UnknownProviderError",
     "register_vad",
     "register_stt",

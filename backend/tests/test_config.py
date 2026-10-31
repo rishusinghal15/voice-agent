@@ -35,6 +35,12 @@ def test_config_defaults() -> None:
     assert settings.LLM_PROVIDER == "mock"
     assert settings.TTS_PROVIDER == "mock"
 
+    # Model Paths & Config
+    assert settings.GROQ_MODEL == "qwen/qwen3.8-27b"
+    assert settings.SILERO_MODEL_PATH == "models/silero_vad.onnx"
+    assert settings.VOSK_MODEL_PATH == "models/vosk-model-small-en-us-0.15"
+    assert settings.PIPER_MODEL_PATH == "models/en_US-lessac-medium.onnx"
+
     # Database
     assert settings.DB_PATH == "voice_agent.db"
     assert settings.HOST == "127.0.0.1"

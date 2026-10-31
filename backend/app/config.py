@@ -46,12 +46,18 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "mock"
     TTS_PROVIDER: str = "mock"
 
-    # Per-provider API Keys
+    # Per-provider API Keys & Models
     GROQ_API_KEY: Optional[str] = None
+    GROQ_MODEL: str = "qwen/qwen3.8-27b"
     DEEPGRAM_API_KEY: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
     CARTESIA_API_KEY: Optional[str] = None
     ELEVENLABS_API_KEY: Optional[str] = None
+
+    # Model Paths
+    SILERO_MODEL_PATH: str = "models/silero_vad.onnx"
+    VOSK_MODEL_PATH: str = "models/vosk-model-small-en-us-0.15"
+    PIPER_MODEL_PATH: str = "models/en_US-lessac-medium.onnx"
 
     # Persistence & Server Configuration
     DB_PATH: str = "voice_agent.db"

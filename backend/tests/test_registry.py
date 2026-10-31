@@ -89,6 +89,30 @@ def test_custom_provider_registration() -> None:
     assert tts.frequency_hz == 880.0
 
 
+def test_registered_providers_available() -> None:
+    """Verify that all required real and mock providers are registered."""
+    from backend.app.adapters.registry import (
+        _LLM_REGISTRY,
+        _STT_REGISTRY,
+        _TTS_REGISTRY,
+        _VAD_REGISTRY,
+    )
+
+    assert "mock" in _VAD_REGISTRY
+    assert "silero" in _VAD_REGISTRY
+    assert "webrtc" in _VAD_REGISTRY
+
+    assert "mock" in _STT_REGISTRY
+    assert "vosk" in _STT_REGISTRY
+    assert "deepgram" in _STT_REGISTRY
+
+    assert "mock" in _LLM_REGISTRY
+    assert "groq" in _LLM_REGISTRY
+
+    assert "mock" in _TTS_REGISTRY
+    assert "piper" in _TTS_REGISTRY
+
+
 def test_validate_providers() -> None:
     """Verify validate_providers validates configured providers without error."""
     validate_providers()
