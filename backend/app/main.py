@@ -4,6 +4,7 @@ Configures FastAPI, lifespan hooks for database initialization, CORS,
 API routers, WebSocket endpoint, and static file serving for the frontend.
 """
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -14,11 +15,37 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.app.adapters.registry import validate_providers
 from backend.app.api import router as api_router
-from backend.app.config import settings
+from backend.app.config import get_providers_line, settings
 from backend.app.db import init_db
 from backend.app.ws import router as ws_router
 
+logger = logging.getLogger("voice_agent")
 FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"
+
+
+def log_startup_providers() -> None:
+    """Log active providers and print a clear warning if any provider is mock."""
+    line = get_providers_line()
+    logger.info(line)
+    print(line, flush=True)
+
+    mock_providers = [
+        p
+        for p, val in [
+            ("vad", settings.VAD_PROVIDER),
+            ("stt", settings.STT_PROVIDER),
+            ("llm", settings.LLM_PROVIDER),
+            ("tts", settings.TTS_PROVIDER),
+        ]
+        if val == "mock"
+    ]
+    if mock_providers:
+        warning_msg = (
+            f"WARNING: Active provider(s) using 'mock': {', '.join(mock_providers)}. "
+            "Offline/simulated responses will be used!"
+        )
+        logger.warning(warning_msg)
+        print(warning_msg, flush=True)
 
 
 @asynccontextmanager
@@ -26,6 +53,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan context manager for startup and shutdown hooks."""
     # Validate adapter providers configured in settings
     validate_providers()
+    # Log active providers and mock warnings
+    log_startup_providers()
     # Initialize SQLite database tables on startup
     await init_db(settings.DB_PATH)
     yield

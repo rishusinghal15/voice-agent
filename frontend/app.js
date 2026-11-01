@@ -281,3 +281,25 @@ function cleanup() {
   btnEnd.disabled = true;
   setStatus("Ended");
 }
+
+async function loadHealthz() {
+  const footerEl = document.getElementById("footerProviders");
+  if (!footerEl) return;
+  try {
+    const res = await fetch("/healthz");
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.providers) {
+        footerEl.textContent = data.providers;
+      }
+    }
+  } catch (err) {
+    console.warn("Could not fetch /healthz:", err);
+  }
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", loadHealthz);
+} else {
+  loadHealthz();
+}

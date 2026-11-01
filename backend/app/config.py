@@ -72,3 +72,14 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+
+def get_providers_line() -> str:
+    """Format single-line description of active providers."""
+    return (
+        f"Providers: vad={settings.VAD_PROVIDER} "
+        f"stt={settings.STT_PROVIDER} "
+        f"llm={settings.LLM_PROVIDER} "
+        f"tts={settings.TTS_PROVIDER} "
+        f"model={settings.GROQ_MODEL}"
+    )

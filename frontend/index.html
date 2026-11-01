@@ -117,6 +117,16 @@
     .msg-system { color: var(--text-muted); font-style: italic; }
     .msg-tool { color: #f59e0b; font-size: 13px; font-family: monospace; }
     .msg-error { color: #f87171; font-weight: 500; }
+    .footer-providers {
+      margin-top: 20px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text-muted);
+      text-align: center;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      word-break: break-all;
+    }
   </style>
 </head>
 <body>
@@ -136,6 +146,8 @@
     <div id="captions" class="captions-box">
       <div class="msg msg-system">Press "Start Call" to begin speaking.</div>
     </div>
+
+    <footer id="footerProviders" class="footer-providers">Loading providers...</footer>
   </div>
 
   <script src="/app.js"></script>

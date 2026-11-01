@@ -28,11 +28,14 @@ def setup_test_db(tmp_path: Path):
 
 
 def test_healthz() -> None:
-    """Verify GET /healthz returns ok: true."""
+    """Verify GET /healthz returns ok: true and active providers line."""
     client = TestClient(app)
     response = client.get("/healthz")
     assert response.status_code == 200
-    assert response.json() == {"ok": True}
+    data = response.json()
+    assert data["ok"] is True
+    assert "providers" in data
+    assert data["providers"].startswith("Providers:")
 
 
 def test_create_and_get_session() -> None:
@@ -62,3 +65,38 @@ def test_get_session_not_found() -> None:
     response = client.get("/sessions/unknown-session-uuid")
     assert response.status_code == 404
     assert "not found" in response.json()["detail"].lower()
+
+
+def test_log_startup_providers_and_mock_warning(capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify startup logging formats providers line and emits clear WARNING for mock."""
+    from backend.app.main import log_startup_providers
+    from backend.app.config import get_providers_line
+
+    # Test with mock providers active
+    monkeypatch.setattr(settings, "VAD_PROVIDER", "mock")
+    monkeypatch.setattr(settings, "STT_PROVIDER", "mock")
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "mock")
+    monkeypatch.setattr(settings, "TTS_PROVIDER", "mock")
+
+    line = get_providers_line()
+    assert "Providers: vad=mock stt=mock llm=mock tts=mock" in line
+
+    log_startup_providers()
+    captured = capsys.readouterr()
+    assert "Providers: vad=mock stt=mock llm=mock tts=mock" in captured.out
+    assert "WARNING" in captured.out
+    assert "mock" in captured.out
+
+    # Test with all real providers active (no warning)
+    monkeypatch.setattr(settings, "VAD_PROVIDER", "silero")
+    monkeypatch.setattr(settings, "STT_PROVIDER", "vosk")
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "groq")
+    monkeypatch.setattr(settings, "TTS_PROVIDER", "piper")
+
+    line_real = get_providers_line()
+    assert "Providers: vad=silero stt=vosk llm=groq tts=piper" in line_real
+
+    log_startup_providers()
+    captured_real = capsys.readouterr()
+    assert "Providers: vad=silero stt=vosk llm=groq tts=piper" in captured_real.out
+    assert "WARNING" not in captured_real.out

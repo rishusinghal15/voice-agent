@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from backend.app import db
+from backend.app.config import get_providers_line
 
 router = APIRouter()
 
@@ -25,6 +26,7 @@ class CreateSessionResponse(BaseModel):
 class HealthzResponse(BaseModel):
     """Response payload for health check."""
     ok: bool = True
+    providers: str
 
 
 @router.post(
@@ -62,6 +64,6 @@ async def get_session_endpoint(session_id: str) -> Dict[str, Any]:
     summary="Health check endpoint",
 )
 async def healthz_endpoint() -> HealthzResponse:
-    """Return health status."""
-    return HealthzResponse(ok=True)
+    """Return health status and active providers."""
+    return HealthzResponse(ok=True, providers=get_providers_line())
 
