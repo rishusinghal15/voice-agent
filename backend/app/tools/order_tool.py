@@ -52,11 +52,23 @@ def get_order_status(order_id: str) -> Dict[str, Any]:
     if not order_id or not isinstance(order_id, str):
         raise OrderNotFoundError(str(order_id))
 
-    clean_id = order_id.strip()
-    if clean_id not in MOCK_ORDERS:
-        raise OrderNotFoundError(clean_id)
+    clean_id = order_id.strip().lower()
+    if clean_id in MOCK_ORDERS:
+        return dict(MOCK_ORDERS[clean_id])
 
-    return dict(MOCK_ORDERS[clean_id])
+    # Normalize variations like "101", "ord-101", "order 101"
+    if clean_id.startswith("ord_"):
+        key = clean_id
+    elif clean_id.startswith("ord"):
+        key = f"ord_{clean_id[3:].lstrip('_-')}"
+    else:
+        digits = "".join(ch for ch in clean_id if ch.isdigit())
+        key = f"ord_{digits}" if digits else clean_id
+
+    if key in MOCK_ORDERS:
+        return dict(MOCK_ORDERS[key])
+
+    raise OrderNotFoundError(clean_id)
 
 
 class OrderTool:

@@ -1,240 +1,112 @@
-# Real-Time Voice Agent MVP
+# Voice Agent MVP
 
-A production-grade, real-time voice assistant built with Python 3.11+, FastAPI, asyncio, WebSockets, and SQLite. The agent listens to user microphone input in real time, converts speech to text, streams tokens through an LLM (with tool-calling capabilities), synthesizes speech sentence-by-sentence, and streams audio back to the client with sub-1.5s end-to-end latency and full barge-in interruption support.
+A real-time voice agent: speak in the browser, hear a spoken reply.
+Pipeline: mic → VAD → streaming STT → LLM (+ tool call) → streaming TTS → speaker,
+with barge-in, per-stage latency metrics, error handling and SQLite persistence.
 
----
-
-## Architecture Overview
-
-The system follows a modular architecture where every pipeline component is isolated behind strict Python Protocols (`backend/app/adapters/protocols.py`). Provider adapters (mock, local, or cloud) are selected dynamically via configuration and a centralized registry (`backend/app/adapters/registry.py`).
+## Architecture
 
 ```
-CLIENT (Browser)                             BACKEND (FastAPI + Asyncio)
-┌────────────────────────┐                   ┌──────────────────────────────────────────────┐
-│  Microphone Capture    │ ─── 16kHz PCM ──> │ VAD (Voice Activity Detector)                │
-│  (16kHz mono s16le)    │     Frames        │   Detects speech_start & speech_end          │
-└────────────────────────┘                   └──────────────────────┬───────────────────────┘
-                                                                    │ Audio frames
-┌────────────────────────┐                   ┌──────────────────────▼───────────────────────┐
-│  Call UI & Captions    │ <─── Events ───── │ Streaming STT Adapter (Mock / Deepgram)      │
-│  (Partial & Final)     │   (JSON over WS)  │   Emits partial & final transcripts          │
-└────────────────────────┘                   └──────────────────────┬───────────────────────┘
-                                                                    │ Final transcript
-┌────────────────────────┐                   ┌──────────────────────▼───────────────────────┐
-│  Audio Playback Queue  │ <─── Binary ───── │ Streaming LLM (Mock / Groq / Gemini)         │
-│  & Barge-in Detector   │      Audio        │   Streams tokens & triggers ToolExecutor     │
-└────────────────────────┘      Chunks       └──────────────────────┬───────────────────────┘
-            │                                                       │ Token stream
-            │ Interrupt (Barge-in)           ┌──────────────────────▼───────────────────────┐
-            └──────────────────────────────> │ Sentence Buffer (Cut at . ! ?, skip abbrev)  │
-                                             └──────────────────────┬───────────────────────┘
-                                                                    │ Complete sentences
-                                             ┌──────────────────────▼───────────────────────┐
-                                             │ Streaming TTS Adapter (Mock / Piper)         │
-                                             │   Synthesizes PCM chunks at 24kHz            │
-                                             └──────────────────────┬───────────────────────┘
-                                                                    │
-                                             ┌──────────────────────▼───────────────────────┐
-                                             │ TurnTimer & SQLite Persistence               │
-                                             │   (sessions, turns, turn_metrics, errors)    │
-                                             └──────────────────────────────────────────────┘
+Browser (mic, 16 kHz resampling, playback, captions, barge-in)
+   │  WebSocket: binary PCM s16le 16 kHz 20 ms frames + JSON events
+   ▼
+FastAPI backend ── Session Manager (state machine: idle/listening/thinking/speaking/ended)
+   ├─ VAD        Silero (ONNX)               adapters/vad_silero.py
+   ├─ STT        Vosk streaming              adapters/stt_vosk.py
+   ├─ LLM        Groq (tool calling)         adapters/llm_groq.py
+   ├─ Tools      get_current_time, get_order_status   tools/
+   ├─ TTS        Piper, sentence-level       adapters/tts_piper.py
+   └─ Metrics    per-turn timings + transcript → SQLite
 ```
 
----
+Every provider sits behind a Protocol (`adapters/protocols.py`) and is chosen by config
+(`*_PROVIDER`). Mock and alternative adapters (Deepgram STT, WebRTC VAD) are included,
+so swapping a provider needs one adapter file plus a config change.
+Event schema, state machine and error matrix: `docs/design.md`.
 
-## Session State Machine
+## Setup
 
-The session enforces strict transitions across 5 core states per design specification:
+Requirements: Python 3.11+ (tested on 3.13), a Groq API key (free tier).
 
-```mermaid
-stateDiagram-v2
-    [*] --> IDLE
-    IDLE --> LISTENING : Start Call (POST /sessions + WS connected)
-    LISTENING --> LISTENING : VAD speech_start
-    LISTENING --> THINKING : VAD speech_end (valid utterance)
-    LISTENING --> LISTENING : VAD speech_end (noise / <250ms)
-    THINKING --> THINKING : transcript_final received / tool_call
-    THINKING --> SPEAKING : First sentence ready for TTS
-    THINKING --> SPEAKING : STT / LLM / TTS error (speak fallback line)
-    SPEAKING --> LISTENING : Reply finished and playback done
-    SPEAKING --> LISTENING : interrupt (Barge-in: cancel LLM & TTS)
-    IDLE --> ENDED : End Call / silence timeout / max duration / WS drop
-    LISTENING --> ENDED : End Call / silence timeout / max duration / WS drop
-    THINKING --> ENDED : End Call / silence timeout / max duration / WS drop
-    SPEAKING --> ENDED : End Call / silence timeout / max duration / WS drop
-    ENDED --> [*]
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+pip install -r requirements.txt
+cp .env.example .env            # then set GROQ_API_KEY
 ```
 
----
+Models (not in git), put them in `models/`:
+- Vosk: `vosk-model-en-us-0.22-lgraph` (alphacephei.com/vosk/models), unzipped
+- Piper voice: `en_US-lessac-medium.onnx` and `.onnx.json` (rhasspy/piper-voices on Hugging Face)
+- Silero VAD: `silero_vad.onnx` (snakers4/silero-vad)
 
-## Key Features
+## Run
 
-- **End-to-End Streaming Pipeline**: VAD speech detection -> STT streaming -> LLM token generation -> Sentence buffering -> TTS audio streaming without waiting for the full response.
-- **Sub-1.5s Latency Budget**: User stops speaking -> first agent audio chunk sent in ~1450 ms (including 600 ms VAD silence wait).
-- **Fast Barge-In Support**: Client monitors speech energy while agent is talking; stops playback and cancels server LLM/TTS within ~300 ms. Sentences actually heard are preserved in history.
-- **Tool Calling with Error-Safety**: LLM can call external tools (`get_current_time`, `get_order_status`). The `ToolExecutor` wraps calls in timeouts and guarantees never to crash the pipeline.
-- **Accurate Per-Stage Latency Measurement**: Monotonic timestamps record exact latencies (`vad_end_ms`, `stt_final_ms`, `llm_first_token_ms`, `tts_first_audio_ms`, `total_ms`).
-- **SQLite Persistence**: Complete history of sessions, user/agent turns, turn latency metrics, and stage errors saved to SQLite.
-- **Web Interface**: Clean, single-page call interface with microphone capture, visual state badge, live captions (partial + final), and barge-in feedback.
+```bash
+uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+```
+Open http://127.0.0.1:8000, click **Start Call**, and speak (use headphones to avoid echo).
+`GET /healthz` shows the active providers. `GET /sessions/<id>` returns the saved
+transcript and per-stage metrics.
 
----
+## Configuration (.env)
 
-## Configuration & Environment Variables
+| Variable | Default / example |
+|---|---|
+| GROQ_API_KEY, GROQ_MODEL | your key, `qwen/qwen3.8-27b` |
+| VAD_PROVIDER / STT_PROVIDER / LLM_PROVIDER / TTS_PROVIDER | silero / vosk / groq / piper (`mock` for offline tests) |
+| VOSK_MODEL_PATH, PIPER_MODEL_PATH, SILERO_MODEL_PATH | paths under `models/` |
+| VAD_SILENCE_MS, VAD_MIN_SPEECH_MS | 600, 250 |
+| MAX_CALL_SECONDS, SILENCE_TIMEOUT_SECONDS | 600, 120 |
+| STT_TIMEOUT_S, LLM_TIMEOUT_S, TTS_TIMEOUT_S, TOOL_TIMEOUT_S | 3, 5, 5, 5 |
+| SYSTEM_PROMPT, DB_PATH | see `.env.example` |
 
-All settings are configured via environment variables or `.env` using Pydantic Settings (`backend/app/config.py`):
+## Tests and benchmark
 
-| Variable | Default | Description |
+```bash
+pytest -q                          # unit + integration tests (mock providers, offline)
+python scripts/smoke_test.py       # one real turn through real providers
+python scripts/benchmark.py        # 20 turns, real providers → docs/latency_report.md
+```
+
+## Latency (20 turns, real providers, synthetic Piper audio)
+
+| Stage | Median | p90 |
 |---|---|---|
-| `SYSTEM_PROMPT` | `"You are a helpful voice assistant."` | Base system prompt for the conversational LLM. |
-| `PROMPT_VERSION` | `"v1.0"` | Version tag recorded with each session. |
-| `FALLBACK_LINE` | `"Sorry, I didn't catch that, could you repeat?"` | Fallback phrase spoken when an adapter encounters an error. |
-| `VAD_SILENCE_MS` | `600` | Silence threshold in ms before declaring end-of-speech. |
-| `VAD_MIN_SPEECH_MS` | `250` | Minimum speech duration in ms (shorter sounds treated as noise). |
-| `MAX_CALL_SECONDS` | `600` | Maximum call duration before graceful goodbye and termination. |
-| `SILENCE_TIMEOUT_SECONDS` | `120` | Silence watchdog timeout before automatic call close. |
-| `STT_TIMEOUT_S` | `3.0` | Timeout in seconds waiting for final STT transcript. |
-| `LLM_TIMEOUT_S` | `5.0` | Timeout in seconds waiting for LLM first token. |
-| `TTS_TIMEOUT_S` | `5.0` | Timeout in seconds waiting for TTS first audio chunk. |
-| `TOOL_TIMEOUT_S` | `5.0` | Timeout in seconds for individual tool execution. |
-| `VAD_PROVIDER` | `"mock"` | VAD adapter provider (`mock`). |
-| `STT_PROVIDER` | `"mock"` | STT adapter provider (`mock`, `deepgram`). |
-| `LLM_PROVIDER` | `"mock"` | LLM adapter provider (`mock`, `groq`). |
-| `TTS_PROVIDER` | `"mock"` | TTS adapter provider (`mock`). |
-| `GROQ_API_KEY` | `None` | Optional API key for Groq high-speed LLM inference. |
-| `DEEPGRAM_API_KEY` | `None` | Optional API key for Deepgram streaming STT. |
-| `DB_PATH` | `"voice_agent.db"` | SQLite database file path. |
-| `HOST` | `"127.0.0.1"` | Host to bind the HTTP and WebSocket server. |
-| `PORT` | `8000` | Port to bind the server. |
+| VAD end-of-speech wait | 600 ms | 600 ms |
+| STT final | 106 ms | 248 ms |
+| LLM first token | 237 ms | 291 ms |
+| TTS first audio | 150 ms | 316 ms |
+| **Total, last spoken word → first agent audio** | **1180 ms** | **1330 ms** |
 
----
+Target was ≤ 1.5 s median. Details and raw rows: `docs/latency_report.md`.
 
-## Getting Started
+## Design decisions
 
-### 1. Prerequisites
-- Python 3.11+
-- Virtual environment (`.venv`)
+- Server-side Silero VAD; client-side adaptive-threshold barge-in (grace period 600 ms,
+  sustained 250 ms) for fast stop, with the server as source of truth (cancels LLM/TTS).
+- Sentence-level TTS, with an early first chunk at a clause boundary to cut time to first audio.
+- Persistent IPv4 HTTP client for Groq. Per-call connections caused multi-second stalls on Windows.
+- First-token timeout (5 s) applies per LLM call, not the whole reply.
+- History keeps only what the user actually heard after a barge-in.
 
-### 2. Activate Virtual Environment & Install Dependencies
-On Windows (PowerShell):
-```powershell
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-```
+## Known limitations (honest notes)
 
-On Linux / macOS:
-```bash
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+- Vosk can mishear names and accented speech; speaking clearly helps. Providers are swappable.
+- Latency numbers use synthetic audio; real microphones and noise will be slower.
+- Barge-in is energy-based on the client; headphones recommended to avoid echo triggers.
+- The browser capture uses ScriptProcessorNode (design doc said AudioWorklet); it works but is deprecated.
+- Free-tier Groq limits can cause occasional delays or fallback replies.
+- Out of scope per assignment: telephony, auth, multi-language, scaling, dashboards.
 
-### 3. Configure Environment (Optional)
-Copy `.env.example` to `.env` if you wish to customize keys or providers:
-```bash
-cp .env.example .env
-```
-*(By default, all providers use high-fidelity `mock` adapters requiring zero external API keys or cloud accounts.)*
-
-### 4. Run the Server
-Start the FastAPI server using Uvicorn:
-```powershell
-.\.venv\Scripts\uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-### 5. Access the Web Application
-Open your browser and navigate to:
-```
-http://127.0.0.1:8000/
-```
-- Click **Start Call** and allow microphone permissions.
-- Speak naturally to interact with the voice assistant.
-- Live partial and final captions will appear on screen.
-- Try speaking over the assistant while it speaks to trigger a **barge-in**.
-- Click **End Call** when finished.
-
----
-
-## Running Tests
-
-Run the full automated test suite covering state transitions, adapter contracts, tool execution, sentence buffering, metrics, pipeline orchestration, and WebSocket communication:
-
-```powershell
-.\.venv\Scripts\pytest -v backend\tests
-```
-
-Run only pipeline integration tests:
-```powershell
-.\.venv\Scripts\pytest -v backend\tests\test_integration.py
-```
-
----
-
-## Latency Benchmark
-
-Execute the latency benchmark script which replays speech audio through the full pipeline for 20 turns and computes Median and P90 percentiles per stage:
-
-```powershell
-.\.venv\Scripts\python scripts\benchmark.py 20
-```
-
-Sample benchmark output:
-```
-==============================================================================
-VOICE AGENT LATENCY BENCHMARK REPORT (20 TURNS)
-==============================================================================
-Pipeline Stage                           Budget     Median       P90         
-------------------------------------------------------------------------------
-VAD end-of-speech (silence wait)            600 ms   600.00 ms    600.00 ms (OK)
-STT final transcript                        200 ms     0.00 ms      0.00 ms (OK)
-LLM first token                             400 ms     0.00 ms      0.00 ms (OK)
-TTS first audio                             250 ms     0.00 ms      0.00 ms (OK)
-Total (end-of-speech to first audio)       1500 ms     0.00 ms      0.00 ms (OK)
-Total from VAD end                          900 ms     0.00 ms      0.00 ms (OK)
-------------------------------------------------------------------------------
-Overall Target (Budget <= 1500 ms): Median = 0.00 ms -> PASSED
-==============================================================================
-```
-
----
-
-## Project Structure
+## Repo layout
 
 ```
-voice-agent/
-├── backend/
-│   ├── app/
-│   │   ├── main.py                # FastAPI initialization, lifespan, and static mounting
-│   │   ├── api.py                 # REST endpoints: POST /sessions, GET /sessions/:id, GET /healthz
-│   │   ├── ws.py                  # WebSocket endpoint: /ws/voice?session_id=<uuid>
-│   │   ├── pipeline.py            # End-to-end voice pipeline orchestration
-│   │   ├── session.py             # Session state machine & design §4 transitions
-│   │   ├── sentence_buffer.py     # Sentence boundary cutting with abbreviation skipping
-│   │   ├── metrics.py             # Monotonic timer & percentile calculations (median, p90)
-│   │   ├── config.py              # Pydantic Settings configuration & defaults
-│   │   ├── db.py                  # SQLite persistence (sessions, turns, turn_metrics, errors)
-│   │   ├── adapters/
-│   │   │   ├── protocols.py       # Strict typing protocols for VAD, STT, LLM, TTS, Tools
-│   │   │   ├── registry.py        # Dynamic provider selection and factory registration
-│   │   │   ├── vad_mock.py        # RMS energy-based mock VAD
-│   │   │   ├── stt_mock.py        # Streaming mock STT
-│   │   │   ├── llm_mock.py        # Word-by-word streaming mock LLM with tool calling
-│   │   │   ├── tts_mock.py        # Sine-wave 24kHz PCM streaming mock TTS
-│   │   │   ├── llm_groq.py        # Live Groq streaming LLM adapter
-│   │   │   └── stt_deepgram.py    # Live Deepgram streaming STT adapter
-│   │   └── tools/
-│   │       ├── executor.py        # ToolExecutor with timeout & never-raise error handling
-│   │       ├── time_tool.py       # get_current_time(timezone) tool
-│   │       └── order_tool.py      # get_order_status(order_id) tool
-│   └── tests/                     # 86 unit and integration test suite
-├── frontend/
-│   ├── index.html                 # Voice Agent web interface
-│   ├── app.js                     # Web Audio API capture, playback queue & barge-in
-│   └── mic-worklet.js             # 16kHz PCM downsampling worklet
-├── scripts/
-│   └── benchmark.py               # 20-turn latency benchmark script
-├── docs/
-│   ├── assignment.md              # Requirements and specifications
-│   └── design.md                  # Architecture and event schema specification
-├── requirements.txt               # Python package dependencies
-├── .env.example                   # Example configuration environment variables
-└── README.md                      # Project documentation and setup guide
+backend/app/   main, api, ws, session, pipeline, sentence_buffer, metrics, config, db
+backend/app/adapters/  vad_*, stt_*, llm_*, tts_*, registry, protocols
+backend/app/tools/     time_tool, order_tool, executor
+backend/tests/ unit + integration tests
+frontend/      index.html, app.js, mic-worklet.js
+scripts/       smoke_test.py, benchmark.py, mic_sim.py
+docs/          design.md, assignment.md, latency_report.md
 ```

@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS turn_metrics (
   llm_first_token_ms REAL,
   tts_first_audio_ms REAL,
   total_ms REAL,
+  total_ms_from_vad_end REAL,
   PRIMARY KEY (session_id, turn_id)
 );
 
@@ -69,6 +70,11 @@ def _get_db_path(db_path: Optional[str] = None) -> str:
 def _sync_init_db(target_path: str) -> None:
     with sqlite3.connect(target_path) as conn:
         conn.executescript(CREATE_TABLES_SQL)
+        # Safe migration: ensure total_ms_from_vad_end exists if table already existed
+        cursor = conn.execute("PRAGMA table_info(turn_metrics)")
+        cols = {row[1] for row in cursor.fetchall()}
+        if "total_ms_from_vad_end" not in cols:
+            conn.execute("ALTER TABLE turn_metrics ADD COLUMN total_ms_from_vad_end REAL")
         conn.commit()
 
 
@@ -232,14 +238,15 @@ def _sync_write_turn_metrics(
     llm_first_token_ms: float,
     tts_first_audio_ms: float,
     total_ms: float,
+    total_ms_from_vad_end: Optional[float] = None,
 ) -> None:
     with sqlite3.connect(target_path) as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO turn_metrics (
                 session_id, turn_id, vad_end_ms, stt_final_ms,
-                llm_first_token_ms, tts_first_audio_ms, total_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                llm_first_token_ms, tts_first_audio_ms, total_ms, total_ms_from_vad_end
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -249,6 +256,7 @@ def _sync_write_turn_metrics(
                 llm_first_token_ms,
                 tts_first_audio_ms,
                 total_ms,
+                total_ms_from_vad_end,
             ),
         )
         conn.commit()
@@ -262,6 +270,7 @@ async def write_turn_metrics(
     llm_first_token_ms: float,
     tts_first_audio_ms: float,
     total_ms: float,
+    total_ms_from_vad_end: Optional[float] = None,
     db_path: Optional[str] = None,
 ) -> None:
     """Write or update turn metrics record."""
@@ -276,6 +285,7 @@ async def write_turn_metrics(
         llm_first_token_ms,
         tts_first_audio_ms,
         total_ms,
+        total_ms_from_vad_end,
     )
 
 
@@ -353,7 +363,7 @@ def _sync_get_turn_metrics(target_path: str, session_id: str) -> List[Dict[str, 
         cur.execute(
             """
             SELECT session_id, turn_id, vad_end_ms, stt_final_ms,
-                   llm_first_token_ms, tts_first_audio_ms, total_ms
+                   llm_first_token_ms, tts_first_audio_ms, total_ms, total_ms_from_vad_end
             FROM turn_metrics
             WHERE session_id = ?
             ORDER BY turn_id ASC

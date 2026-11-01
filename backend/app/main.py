@@ -57,6 +57,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log_startup_providers()
     # Initialize SQLite database tables on startup
     await init_db(settings.DB_PATH)
+    # Warm up Silero VAD model in worker thread if active
+    if settings.VAD_PROVIDER.lower() == "silero":
+        import asyncio
+        from backend.app.adapters.vad_silero import warmup_silero_model
+        await asyncio.to_thread(warmup_silero_model)
     # Warm up Vosk STT model in worker thread if active
     if settings.STT_PROVIDER.lower() == "vosk":
         import asyncio
@@ -66,6 +71,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.LLM_PROVIDER.lower() == "groq":
         from backend.app.adapters.llm_groq import get_groq_client
         get_groq_client()
+    # Warm up Piper TTS model in worker thread if active
+    if settings.TTS_PROVIDER.lower() == "piper":
+        import asyncio
+        from backend.app.adapters.tts_piper import warmup_piper_model
+        await asyncio.to_thread(warmup_piper_model)
     yield
     # Shutdown hooks
     from backend.app.adapters.llm_groq import close_groq_client

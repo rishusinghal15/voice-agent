@@ -91,3 +91,36 @@ def test_flush_behavior():
     assert sb.is_empty()
     assert sb.flush() == ""
 
+
+def test_first_chunk_emitted_at_comma_with_min_words():
+    """Verify first chunk of reply is emitted at comma once words >= 6."""
+    sb = SentenceBuffer(first_chunk_min_words=6)
+    # 7 words before comma
+    text = "It is currently 10:00 PM on Sunday, in Tokyo right now. "
+    chunks = list(sb.feed(text))
+    assert len(chunks) == 2
+    assert chunks[0] == "It is currently 10:00 PM on Sunday,"
+    assert chunks[1] == "in Tokyo right now."
+
+
+def test_first_chunk_not_emitted_if_fewer_than_min_words():
+    """Verify comma is NOT split if it has fewer than FIRST_CHUNK_MIN_WORDS."""
+    sb = SentenceBuffer(first_chunk_min_words=6)
+    # Only 3 words before comma
+    text = "Hello there, friend. How are you? "
+    chunks = list(sb.feed(text))
+    # Full sentence split at period, not comma
+    assert chunks == ["Hello there, friend.", "How are you?"]
+
+
+def test_first_chunk_only_applies_to_first_chunk():
+    """Verify second sentence does not split at commas."""
+    sb = SentenceBuffer(first_chunk_min_words=6)
+    # First sentence has period early
+    text = "Yes! In terms of the weather today, it is quite warm outside. "
+    chunks = list(sb.feed(text))
+    assert chunks[0] == "Yes!"
+    # The comma in the second sentence is not split because first chunk was already emitted
+    assert chunks[1] == "In terms of the weather today, it is quite warm outside."
+
+

@@ -674,10 +674,12 @@ class VoicePipeline:
                     sentence_index += 1
 
                 total_audio_ms = sum(s[1] for s in self.sent_sentences)
+                turn_metrics = self.turn_timer.compute()
                 await self.emit_json({
                     "type": "turn_done",
                     "turn_id": self.turn_id,
                     "total_audio_ms": round(total_audio_ms, 2),
+                    "metrics": turn_metrics.to_dict(),
                 })
                 break
 
@@ -789,6 +791,7 @@ class VoicePipeline:
                 llm_first_token_ms=metrics.llm_first_token_ms,
                 tts_first_audio_ms=metrics.tts_first_audio_ms,
                 total_ms=metrics.total_ms,
+                total_ms_from_vad_end=metrics.total_ms_from_vad_end,
             )
 
             # Advance to next turn
@@ -980,6 +983,7 @@ class VoicePipeline:
                         llm_first_token_ms=metrics.llm_first_token_ms,
                         tts_first_audio_ms=metrics.tts_first_audio_ms,
                         total_ms=metrics.total_ms,
+                        total_ms_from_vad_end=metrics.total_ms_from_vad_end,
                     )
                 except Exception as e:
                     logger.warning(

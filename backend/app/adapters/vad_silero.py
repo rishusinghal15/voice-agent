@@ -132,3 +132,14 @@ class SileroVADProcessor:
 
         return event_to_emit
 
+
+def warmup_silero_model() -> None:
+    """Warm up Silero VAD model by loading ONNX session and running one dummy inference."""
+    try:
+        proc = SileroVADProcessor()
+        proc.process(bytes(640))
+    except Exception as exc:
+        import logging
+        logging.getLogger("voice_agent").warning(f"Silero VAD warmup failed: {exc}")
+
+

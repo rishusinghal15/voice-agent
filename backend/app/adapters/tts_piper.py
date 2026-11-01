@@ -74,3 +74,14 @@ class PiperTTSAdapter:
         except asyncio.CancelledError:
             raise
 
+
+def warmup_piper_model() -> None:
+    """Warm up Piper TTS model by loading the voice and synthesizing a dummy word."""
+    try:
+        adapter = PiperTTSAdapter()
+        list(adapter._sync_synthesize("Hello"))
+    except Exception as exc:
+        import logging
+        logging.getLogger("voice_agent").warning(f"Piper TTS warmup failed: {exc}")
+
+
