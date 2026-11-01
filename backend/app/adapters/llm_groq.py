@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
 import httpx
 
 from backend.app.adapters.protocols import (
@@ -99,6 +99,7 @@ class GroqLLMAdapter:
         self,
         messages: List[Message],
         tools: Optional[List[ToolSpec]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> AsyncIterator[LLMEvent]:
         """Stream TextDelta, ToolCall, or Done events from Groq API."""
         if not self.api_key:
@@ -140,7 +141,21 @@ class GroqLLMAdapter:
         }
         if api_tools:
             payload["tools"] = api_tools
-            payload["tool_choice"] = "auto"
+            if tool_choice:
+                if isinstance(tool_choice, str):
+                    if tool_choice in ("auto", "none", "required"):
+                        payload["tool_choice"] = tool_choice
+                    else:
+                        payload["tool_choice"] = {
+                            "type": "function",
+                            "function": {"name": tool_choice},
+                        }
+                elif isinstance(tool_choice, dict):
+                    payload["tool_choice"] = tool_choice
+                else:
+                    payload["tool_choice"] = "auto"
+            else:
+                payload["tool_choice"] = "auto"
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import traceback
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -34,6 +35,9 @@ except ImportError:
         pass
 
 from backend.app import db
+
+TIME_TOOL_REGEX = re.compile(r"\b(time|date|day|today|clock)\b", re.IGNORECASE)
+ORDER_TOOL_REGEX = re.compile(r"order", re.IGNORECASE)
 from backend.app.adapters.protocols import (
     Done,
     LLMAdapter,
@@ -535,14 +539,33 @@ class VoicePipeline:
         first_token_stamped = False
         first_sentence_stamped = False
 
+        # Determine forced tool choice for the first LLM call of the turn
+        user_text = ""
+        for m in reversed(self.history):
+            if m.get("role") == "user":
+                user_text = m.get("content", "")
+                break
+
+        is_first_llm_call = True
+
         while True:
+            if is_first_llm_call:
+                if TIME_TOOL_REGEX.search(user_text):
+                    current_tool_choice: Any = {"type": "function", "function": {"name": "get_current_time"}}
+                elif ORDER_TOOL_REGEX.search(user_text):
+                    current_tool_choice = {"type": "function", "function": {"name": "get_order_status"}}
+                else:
+                    current_tool_choice = "auto"
+            else:
+                current_tool_choice = "auto"
+
             tool_call_to_run: Optional[ToolCall] = None
             first_token_received = False
             first_event_received = asyncio.Event()
 
             async def _run_llm_stream() -> None:
                 nonlocal tool_call_to_run, first_token_stamped, first_sentence_stamped, sentence_index, first_token_received
-                async for event in self.llm.stream(messages, tools):
+                async for event in self.llm.stream(messages, tools, tool_choice=current_tool_choice):
                     first_event_received.set()
                     if isinstance(event, ToolCall):
                         tool_call_to_run = event
@@ -613,14 +636,24 @@ class VoicePipeline:
                 return
 
             if tool_call_to_run is not None:
-                # Intercept tool call
+                # Next LLM call is after tool result, call normally
+                is_first_llm_call = False
                 tc = tool_call_to_run
+
+                if tc.name == "get_current_time":
+                    if not tc.args or not tc.args.get("timezone"):
+                        tc.args = dict(tc.args or {})
+                        tc.args["timezone"] = "Asia/Kolkata"
+
                 self.session.transition(SessionEvent.TOOL_CALL_REQUESTED)
                 await self.emit_json({
                     "type": "tool_event",
                     "turn_id": self.turn_id,
                     "name": tc.name,
+                    "tool": tc.name,
                     "status": "started",
+                    "event": "start",
+                    "args": tc.args,
                 })
 
                 tool_res = await self.executor.run(tc.name, tc.args)
@@ -629,7 +662,11 @@ class VoicePipeline:
                     "type": "tool_event",
                     "turn_id": self.turn_id,
                     "name": tc.name,
+                    "tool": tc.name,
                     "status": status_str,
+                    "event": "done",
+                    "args": tc.args,
+                    "result": tool_res,
                 })
 
                 self.turn_tool_calls.append({

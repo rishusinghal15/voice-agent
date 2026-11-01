@@ -125,6 +125,7 @@ class LLMAdapter(Protocol):
         self,
         messages: List[Message],
         tools: List[ToolSpec],
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> AsyncIterator[LLMEvent]:
         """Stream tokens and tool calls from LLM given message history and tool specs."""
         ...
