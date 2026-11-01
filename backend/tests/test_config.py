@@ -13,7 +13,8 @@ def test_config_defaults() -> None:
     settings = Settings()
 
     # System & Prompt Configuration
-    assert settings.SYSTEM_PROMPT == "You are a helpful voice assistant."
+    assert bool(settings.SYSTEM_PROMPT)
+    assert "get_current_time" in settings.SYSTEM_PROMPT
     assert settings.PROMPT_VERSION == "v1.0"
     assert settings.FALLBACK_LINE == "Sorry, I didn't catch that, could you repeat?"
 
@@ -38,7 +39,7 @@ def test_config_defaults() -> None:
     # Model Paths & Config
     assert settings.GROQ_MODEL == "qwen/qwen3.8-27b"
     assert settings.SILERO_MODEL_PATH == "models/silero_vad.onnx"
-    assert settings.VOSK_MODEL_PATH == "models/vosk-model-small-en-us-0.15"
+    assert settings.VOSK_MODEL_PATH == "models/vosk-model-en-us-0.22-lgraph"
     assert settings.PIPER_MODEL_PATH == "models/en_US-lessac-medium.onnx"
 
     # Database

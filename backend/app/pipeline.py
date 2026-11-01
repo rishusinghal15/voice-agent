@@ -121,6 +121,7 @@ class VoicePipeline:
         self.current_agent_text: List[str] = []
 
         self.closed: bool = False
+        self.db_ended: bool = False
 
         # Periodic 1s metrics logging stats
         self._log_frames_count: int = 0
@@ -153,7 +154,7 @@ class VoicePipeline:
         """Start periodic 1-second session logging task."""
         if not self.closed and (self._periodic_logger_task is None or self._periodic_logger_task.done()):
             self._periodic_logger_task = asyncio.create_task(
-                self._wrap_task("periodic_logger", self._periodic_logger())
+                self._periodic_logger()
             )
 
     async def _periodic_logger(self) -> None:
@@ -195,16 +196,38 @@ class VoicePipeline:
                 self._log_stt_texts.clear()
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            logger.error(
+                f"[Session {self.session_id}] Periodic logger error: {exc}\n{traceback.format_exc()}"
+            )
 
     async def emit_json(self, payload: Dict[str, Any]) -> None:
         """Send JSON message to client, ensuring 'ts' (epoch ms) is included."""
+        if self.closed and payload.get("type") != "call_ended":
+            return
         if "ts" not in payload:
             payload["ts"] = current_epoch_ms()
-        await self._emit_json_raw(payload)
+        try:
+            await self._emit_json_raw(payload)
+        except RuntimeError as exc:
+            if "Unexpected ASGI message" in str(exc) or "websocket.close" in str(exc):
+                return
+            raise
+        except (WebSocketDisconnect, ClientDisconnected):
+            return
 
     async def emit_audio(self, chunk: bytes) -> None:
         """Send raw binary PCM chunk to client."""
-        await self._emit_audio_raw(chunk)
+        if self.closed:
+            return
+        try:
+            await self._emit_audio_raw(chunk)
+        except RuntimeError as exc:
+            if "Unexpected ASGI message" in str(exc) or "websocket.close" in str(exc):
+                return
+            raise
+        except (WebSocketDisconnect, ClientDisconnected):
+            return
 
     async def start(self) -> None:
         """Initialize pipeline, transition to LISTENING and start timeouts."""
@@ -219,33 +242,44 @@ class VoicePipeline:
         self._start_periodic_logger()
 
     def _reset_silence_timer(self) -> None:
-        """Reset the 120s silence timeout watchdog."""
+        """Reset the silence timeout watchdog."""
         self._cancel_silence_timer()
         if not self.closed:
             self.silence_timer_task = asyncio.create_task(
-                self._wrap_task("silence_timer", self._silence_watchdog())
+                self._silence_watchdog()
             )
 
     def _cancel_silence_timer(self) -> None:
         """Cancel active silence timeout watchdog."""
-        if self.silence_timer_task and not self.silence_timer_task.done():
+        if (
+            self.silence_timer_task
+            and not self.silence_timer_task.done()
+            and self.silence_timer_task != asyncio.current_task()
+        ):
             self.silence_timer_task.cancel()
-            self.silence_timer_task = None
+        self.silence_timer_task = None
 
     async def _silence_watchdog(self) -> None:
         """Watchdog firing when silence exceeds SILENCE_TIMEOUT_SECONDS."""
         try:
             await asyncio.sleep(settings.SILENCE_TIMEOUT_SECONDS)
             if not self.closed:
-                await self.handle_end_call(reason="silence_timeout")
+                logger.info(
+                    f"[Session {self.session_id}] Silence timeout reached ({settings.SILENCE_TIMEOUT_SECONDS}s)"
+                )
+                await self.handle_timeout_end(reason="silence_timeout")
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            logger.error(
+                f"[Session {self.session_id}] Silence watchdog error: {exc}\n{traceback.format_exc()}"
+            )
 
     def _start_max_duration_timer(self) -> None:
         """Start watchdog for MAX_CALL_SECONDS."""
         if not self.closed:
             self.max_duration_task = asyncio.create_task(
-                self._wrap_task("max_duration", self._max_duration_watchdog())
+                self._max_duration_watchdog()
             )
 
     async def _max_duration_watchdog(self) -> None:
@@ -253,9 +287,60 @@ class VoicePipeline:
         try:
             await asyncio.sleep(settings.MAX_CALL_SECONDS)
             if not self.closed:
-                await self.handle_end_call(reason="max_duration")
+                logger.info(
+                    f"[Session {self.session_id}] Max call duration reached ({settings.MAX_CALL_SECONDS}s)"
+                )
+                await self.handle_timeout_end(reason="max_duration")
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            logger.error(
+                f"[Session {self.session_id}] Max duration watchdog error: {exc}\n{traceback.format_exc()}"
+            )
+
+    async def handle_timeout_end(self, reason: str) -> None:
+        """Speak a short goodbye and end call due to timeout (silence or max duration)."""
+        if self.closed:
+            return
+
+        goodbye = "Thank you for calling. Goodbye!"
+        try:
+            if self.session.state != SessionState.SPEAKING:
+                self.session.state = SessionState.SPEAKING
+                await self.emit_json({
+                    "type": "state",
+                    "state": self.session.state.value,
+                })
+
+            await self.emit_json({
+                "type": "agent_text",
+                "text": goodbye,
+                "turn_id": self.turn_id,
+                "sentence_index": 0,
+            })
+
+            try:
+                await self.emit_json({
+                    "type": "agent_audio_start",
+                    "turn_id": self.turn_id,
+                    "sentence_index": 0,
+                    "sample_rate": self.tts.sample_rate,
+                    "encoding": "pcm_s16le",
+                    "channels": 1,
+                })
+                async for chunk in self.tts.synthesize(goodbye):
+                    await self.emit_audio(chunk)
+                await self.emit_json({
+                    "type": "agent_audio_end",
+                    "turn_id": self.turn_id,
+                    "sentence_index": 0,
+                })
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.warning(f"[Session {self.session_id}] Error sending goodbye on timeout: {exc}")
+
+        await self.handle_end_call(reason=reason)
 
     async def handle_ping(self) -> None:
         """Respond to client ping keepalive."""
@@ -841,16 +926,21 @@ class VoicePipeline:
 
     async def handle_end_call(self, reason: str = "user_end") -> None:
         """Terminate call session gracefully."""
-        if self.closed:
+        if self.closed or getattr(self, "_closing", False):
             return
-        self.closed = True
+        self._closing = True
 
         self._cancel_silence_timer()
         if self._periodic_logger_task and not self._periodic_logger_task.done():
             self._periodic_logger_task.cancel()
 
-        if self.max_duration_task and not self.max_duration_task.done():
+        if (
+            self.max_duration_task
+            and not self.max_duration_task.done()
+            and self.max_duration_task != asyncio.current_task()
+        ):
             self.max_duration_task.cancel()
+        self.max_duration_task = None
 
         if self.active_turn_task and not self.active_turn_task.done():
             self.active_turn_task.cancel()
@@ -903,19 +993,34 @@ class VoicePipeline:
         except Exception:
             self.session.state = SessionState.ENDED
 
-        try:
-            await self.emit_json({
-                "type": "call_ended",
-                "reason": reason,
-            })
-        except Exception:
-            # Client socket may already be closed (e.g. ws_drop)
-            pass
+        if reason != "ws_drop":
+            try:
+                await self.emit_json({
+                    "type": "call_ended",
+                    "reason": reason,
+                })
+            except Exception:
+                # Client socket may already be closed (e.g. ws_drop)
+                pass
 
-        await db.end_session(
-            session_id=self.session_id,
-            end_reason=reason,
-        )
+        if not self.db_ended:
+            self.db_ended = True
+            try:
+                await asyncio.shield(
+                    db.end_session(
+                        session_id=self.session_id,
+                        end_reason=reason,
+                    )
+                )
+            except (asyncio.CancelledError, Exception):
+                from datetime import datetime, timezone
+                db._sync_end_session(
+                    db._get_db_path(),
+                    self.session_id,
+                    datetime.now(timezone.utc).isoformat(),
+                    reason,
+                )
+        self.closed = True
 
     async def close(self, reason: str = "ws_drop") -> None:
         """Clean up on socket disconnection."""

@@ -8,9 +8,17 @@ import json
 import pytest
 import httpx
 
-from backend.app.adapters.llm_groq import GroqLLMAdapter
+from backend.app.adapters.llm_groq import GroqLLMAdapter, reset_groq_client
 from backend.app.adapters.protocols import Done, Message, TextDelta, ToolCall, ToolSpec
 from backend.app.config import settings
+
+
+@pytest.fixture(autouse=True)
+def cleanup_groq_client():
+    """Ensure tests are isolated and don't leak shared clients."""
+    reset_groq_client(None)
+    yield
+    reset_groq_client(None)
 
 
 @pytest.mark.asyncio
@@ -37,15 +45,9 @@ async def test_groq_streaming_text(monkeypatch):
         return httpx.Response(200, content="".join(sse_lines).encode("utf-8"))
 
     transport = httpx.MockTransport(mock_handler)
-    original_client = httpx.AsyncClient
+    client = httpx.AsyncClient(transport=transport)
 
-    def patched_client(*args, **kwargs):
-        kwargs["transport"] = transport
-        return original_client(*args, **kwargs)
-
-    monkeypatch.setattr("backend.app.adapters.llm_groq.httpx.AsyncClient", patched_client)
-
-    adapter = GroqLLMAdapter(api_key="gsk_test123")
+    adapter = GroqLLMAdapter(api_key="gsk_test123", client=client)
     events = []
     async for ev in adapter.stream([Message(role="user", content="hello")]):
         events.append(ev)
@@ -105,15 +107,9 @@ async def test_groq_streaming_tool_call(monkeypatch):
         return httpx.Response(200, content="".join(sse_lines).encode("utf-8"))
 
     transport = httpx.MockTransport(mock_handler)
-    original_client = httpx.AsyncClient
+    client = httpx.AsyncClient(transport=transport)
 
-    def patched_client(*args, **kwargs):
-        kwargs["transport"] = transport
-        return original_client(*args, **kwargs)
-
-    monkeypatch.setattr("backend.app.adapters.llm_groq.httpx.AsyncClient", patched_client)
-
-    adapter = GroqLLMAdapter(api_key="gsk_test123")
+    adapter = GroqLLMAdapter(api_key="gsk_test123", client=client)
     tools = [ToolSpec(name="get_current_time", description="Get current time")]
     events = []
     async for ev in adapter.stream([Message(role="user", content="time")], tools=tools):

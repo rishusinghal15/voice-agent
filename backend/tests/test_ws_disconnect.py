@@ -28,9 +28,12 @@ def setup_test_db(tmp_path):
     """Ensure a fresh clean database for WebSocket disconnect tests."""
     test_db = str(tmp_path / "test_ws_disconnect.db")
     settings.DB_PATH = test_db
+    orig_tts = settings.TTS_PROVIDER
+    settings.TTS_PROVIDER = "mock"
     asyncio.run(db.init_db(test_db))
     yield
     settings.DB_PATH = "voice_agent.db"
+    settings.TTS_PROVIDER = orig_tts
 
 
 @pytest.mark.asyncio

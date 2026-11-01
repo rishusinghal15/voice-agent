@@ -67,6 +67,12 @@ async def close_groq_client() -> None:
         _shared_client = None
 
 
+def reset_groq_client(new_client: Optional[httpx.AsyncClient] = None) -> None:
+    """Reset or replace the shared persistent Groq client (e.g. for testing)."""
+    global _shared_client
+    _shared_client = new_client
+
+
 class GroqLLMAdapter:
     """Streaming LLM adapter communicating with Groq's high-speed inference API."""
 
