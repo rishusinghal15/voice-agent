@@ -13,7 +13,9 @@ Follows design doc §6:
 from __future__ import annotations
 
 import json
+import logging
 import time
+import traceback
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
@@ -23,6 +25,7 @@ from backend.app.pipeline import VoicePipeline
 from backend.app.session import Session, SessionEvent, SessionState
 
 router = APIRouter()
+logger = logging.getLogger("voice_agent.ws")
 
 
 def current_epoch_ms() -> int:
@@ -248,7 +251,10 @@ async def websocket_voice_endpoint(
 
     except WebSocketDisconnect:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error(
+            f"[WS Voice] Exception in websocket handler for session_id={session_id}: {exc}\n"
+            f"{traceback.format_exc()}"
+        )
     finally:
         await pipeline.close(reason="ws_drop")

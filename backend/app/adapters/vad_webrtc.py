@@ -33,12 +33,22 @@ class WebRTCVADProcessor:
             if min_speech_ms is not None
             else float(settings.VAD_MIN_SPEECH_MS)
         )
+        self.last_prob: float = 0.0
+        self.max_prob: float = 0.0
         self.reset()
 
     def reset(self) -> None:
         """Reset internal speech state and timers."""
         self._is_speaking = False
         self._consecutive_silence_ms = 0.0
+        self.last_prob = 0.0
+        self.max_prob = 0.0
+
+    def get_and_reset_max_prob(self) -> float:
+        """Return the maximum speech probability since last call and reset it."""
+        p = self.max_prob
+        self.max_prob = self.last_prob
+        return p
 
     def process(self, frame: bytes) -> Optional[VADEvent]:
         """Process 20ms 16kHz mono 16-bit PCM frame (640 bytes)."""
@@ -48,6 +58,10 @@ class WebRTCVADProcessor:
             return None
 
         is_speech = self.vad.is_speech(frame, 16000)
+        prob = 1.0 if is_speech else 0.0
+        self.last_prob = prob
+        if prob > self.max_prob:
+            self.max_prob = prob
 
         if not self._is_speaking:
             if is_speech:

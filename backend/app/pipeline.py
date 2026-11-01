@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
+import traceback
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
 
 from backend.app import db
 from backend.app.adapters.protocols import (
@@ -52,6 +56,9 @@ from backend.app.tools.executor import ToolExecutor, create_default_tool_executo
 def current_epoch_ms() -> int:
     """Return current server time as epoch milliseconds."""
     return int(time.time() * 1000)
+
+
+logger = logging.getLogger("voice_agent.pipeline")
 
 
 class VoicePipeline:
@@ -107,6 +114,75 @@ class VoicePipeline:
 
         self.closed: bool = False
 
+        # Periodic 1s metrics logging stats
+        self._log_frames_count: int = 0
+        self._log_bytes_count: int = 0
+        self._log_max_amplitude: int = 0
+        self._log_max_silero_prob: float = 0.0
+        self._log_vad_transitions: List[str] = []
+        self._log_stt_texts: List[str] = []
+        self._periodic_logger_task: Optional[asyncio.Task] = None
+
+    async def _wrap_task(self, name: str, coro: Awaitable[Any]) -> Any:
+        """Wrap background task to ensure exceptions are logged with full traceback."""
+        try:
+            return await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                f"[Session {self.session_id}] Background task '{name}' failed with error: {exc}\n"
+                f"{traceback.format_exc()}"
+            )
+            raise
+
+    def _start_periodic_logger(self) -> None:
+        """Start periodic 1-second session logging task."""
+        if not self.closed and (self._periodic_logger_task is None or self._periodic_logger_task.done()):
+            self._periodic_logger_task = asyncio.create_task(
+                self._wrap_task("periodic_logger", self._periodic_logger())
+            )
+
+    async def _periodic_logger(self) -> None:
+        """Log per-second audio & pipeline metrics at INFO level."""
+        try:
+            while not self.closed:
+                await asyncio.sleep(1.0)
+                if self.closed:
+                    break
+
+                vad_p = getattr(self.vad, "get_and_reset_max_prob", None)
+                if callable(vad_p):
+                    prob_val = vad_p()
+                    if prob_val > self._log_max_silero_prob:
+                        self._log_max_silero_prob = prob_val
+                else:
+                    vad_last = getattr(self.vad, "last_prob", None)
+                    if vad_last is not None and vad_last > self._log_max_silero_prob:
+                        self._log_max_silero_prob = float(vad_last)
+
+                vad_str = ", ".join(self._log_vad_transitions) if self._log_vad_transitions else "none"
+                stt_str = " | ".join(self._log_stt_texts) if self._log_stt_texts else "none"
+
+                logger.info(
+                    f"[Session {self.session_id}] 1s Metrics: "
+                    f"frames_rcvd={self._log_frames_count}, "
+                    f"bytes={self._log_bytes_count}, "
+                    f"max_pcm_amp={self._log_max_amplitude}, "
+                    f"silero_prob_max={self._log_max_silero_prob:.3f}, "
+                    f"vad_transitions=[{vad_str}], "
+                    f"stt=[{stt_str}]"
+                )
+
+                self._log_frames_count = 0
+                self._log_bytes_count = 0
+                self._log_max_amplitude = 0
+                self._log_max_silero_prob = 0.0
+                self._log_vad_transitions.clear()
+                self._log_stt_texts.clear()
+        except asyncio.CancelledError:
+            pass
+
     async def emit_json(self, payload: Dict[str, Any]) -> None:
         """Send JSON message to client, ensuring 'ts' (epoch ms) is included."""
         if "ts" not in payload:
@@ -119,6 +195,7 @@ class VoicePipeline:
 
     async def start(self) -> None:
         """Initialize pipeline, transition to LISTENING and start timeouts."""
+        logger.info(f"[Session {self.session_id}] Pipeline task started (initial state: {self.session.state.value})")
         self.session.transition(SessionEvent.SESSION_START)
         await self.emit_json({
             "type": "state",
@@ -126,12 +203,15 @@ class VoicePipeline:
         })
         self._reset_silence_timer()
         self._start_max_duration_timer()
+        self._start_periodic_logger()
 
     def _reset_silence_timer(self) -> None:
         """Reset the 120s silence timeout watchdog."""
         self._cancel_silence_timer()
         if not self.closed:
-            self.silence_timer_task = asyncio.create_task(self._silence_watchdog())
+            self.silence_timer_task = asyncio.create_task(
+                self._wrap_task("silence_timer", self._silence_watchdog())
+            )
 
     def _cancel_silence_timer(self) -> None:
         """Cancel active silence timeout watchdog."""
@@ -151,7 +231,9 @@ class VoicePipeline:
     def _start_max_duration_timer(self) -> None:
         """Start watchdog for MAX_CALL_SECONDS."""
         if not self.closed:
-            self.max_duration_task = asyncio.create_task(self._max_duration_watchdog())
+            self.max_duration_task = asyncio.create_task(
+                self._wrap_task("max_duration", self._max_duration_watchdog())
+            )
 
     async def _max_duration_watchdog(self) -> None:
         """Watchdog firing when call duration reaches MAX_CALL_SECONDS."""
@@ -171,11 +253,28 @@ class VoicePipeline:
         if self.closed:
             return
 
+        # Accounting for periodic 1-second session metrics
+        self._log_frames_count += 1
+        self._log_bytes_count += len(frame)
+        if len(frame) >= 2:
+            samples = np.frombuffer(frame, dtype=np.int16)
+            if len(samples) > 0:
+                amp = int(np.max(np.abs(samples)))
+                if amp > self._log_max_amplitude:
+                    self._log_max_amplitude = amp
+
         # Only process audio input when in LISTENING state
         if self.session.state != SessionState.LISTENING:
             return
 
         event = self.vad.process(frame)
+
+        prob = getattr(self.vad, "last_prob", None)
+        if prob is not None and prob > self._log_max_silero_prob:
+            self._log_max_silero_prob = float(prob)
+
+        if event:
+            self._log_vad_transitions.append(event.type.name)
 
         if event and event.type == VADEventType.SPEECH_START:
             self._cancel_silence_timer()
@@ -189,7 +288,7 @@ class VoicePipeline:
             self.final_transcript_queue = asyncio.Queue()
             self.stt_stream = await self.stt.open_stream(sample_rate=16000)
             self.stt_events_task = asyncio.create_task(
-                self._consume_stt_events(self.stt_stream)
+                self._wrap_task("stt_events", self._consume_stt_events(self.stt_stream))
             )
             await self.stt_stream.send_audio(frame)
 
@@ -218,26 +317,34 @@ class VoicePipeline:
                     "type": "state",
                     "state": self.session.state.value,
                 })
-                self.active_turn_task = asyncio.create_task(self._run_turn())
+                self.active_turn_task = asyncio.create_task(
+                    self._wrap_task("active_turn", self._run_turn())
+                )
 
     async def _consume_stt_events(self, stream: STTStream) -> None:
         """Background worker consuming events from streaming STT."""
         try:
             async for event in stream.events():
                 if isinstance(event, STTPartial):
+                    if event.text:
+                        self._log_stt_texts.append(f"partial:'{event.text}'")
                     await self.emit_json({
                         "type": "transcript_partial",
                         "text": event.text,
                     })
                 elif isinstance(event, STTFinal):
+                    if event.text:
+                        self._log_stt_texts.append(f"final:'{event.text}'")
                     await self.final_transcript_queue.put(event.text)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
+            logger.error(f"[Session {self.session_id}] Exception in STT event stream: {exc}\n{traceback.format_exc()}")
             await self.final_transcript_queue.put("")
 
     async def _run_turn(self) -> None:
         """Coordinate STT finalization, LLM streaming, tools, and TTS synthesis."""
+        logger.info(f"[Session {self.session_id}] Pipeline turn task started for turn_id={self.turn_id}")
         try:
             # 1. Finalize STT
             if self.stt_stream:
@@ -683,6 +790,9 @@ class VoicePipeline:
         self.closed = True
 
         self._cancel_silence_timer()
+        if self._periodic_logger_task and not self._periodic_logger_task.done():
+            self._periodic_logger_task.cancel()
+
         if self.max_duration_task and not self.max_duration_task.done():
             self.max_duration_task.cancel()
 

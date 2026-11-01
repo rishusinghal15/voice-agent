@@ -22,6 +22,18 @@ const btnEnd = document.getElementById("btnEnd");
 const statusBadge = document.getElementById("statusBadge");
 const statusText = document.getElementById("statusText");
 const captions = document.getElementById("captions");
+const micMeterBar = document.getElementById("micMeterBar");
+const micMeterValue = document.getElementById("micMeterValue");
+const dbgSampleRate = document.getElementById("dbgSampleRate");
+const dbgFps = document.getElementById("dbgFps");
+const dbgBytesPerFrame = document.getElementById("dbgBytesPerFrame");
+
+let biquadFilter = null;
+let inputCarry = new Float32Array(0);
+let resamplePos = 0.0;
+let outputCarry = new Float32Array(0);
+let framesSentCount = 0;
+let lastFpsTimestamp = 0;
 
 function setStatus(state) {
   currentState = state.toLowerCase();
@@ -161,22 +173,49 @@ btnStart.addEventListener("click", async () => {
       btnEnd.disabled = false;
       logMessage("Connected to server.", "system");
 
-      // Setup audio capture and barge-in energy monitor
+      // Setup audio capture, anti-aliasing low-pass, 16kHz resampling, and live meter
       audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const inSampleRate = audioContext.sampleRate;
+      if (dbgSampleRate) dbgSampleRate.textContent = inSampleRate;
+      if (dbgBytesPerFrame) dbgBytesPerFrame.textContent = "640";
+      if (dbgFps) dbgFps.textContent = "0.0";
+
+      inputCarry = new Float32Array(0);
+      resamplePos = 0.0;
+      outputCarry = new Float32Array(0);
+      framesSentCount = 0;
+      lastFpsTimestamp = performance.now();
+
+      // Create hardware anti-aliasing lowpass filter (cutoff 7500 Hz for 16 kHz Nyquist at 8000 Hz)
+      biquadFilter = audioContext.createBiquadFilter();
+      biquadFilter.type = "lowpass";
+      biquadFilter.frequency.setValueAtTime(7500, audioContext.currentTime);
+      biquadFilter.Q.setValueAtTime(0.707, audioContext.currentTime);
+
       const source = audioContext.createMediaStreamSource(micStream);
-      scriptProcessor = audioContext.createScriptProcessor(1024, 1, 1);
+      source.connect(biquadFilter);
+
+      // ScriptProcessor with buffer size 2048 to minimize callback overhead
+      scriptProcessor = audioContext.createScriptProcessor(2048, 1, 1);
+      biquadFilter.connect(scriptProcessor);
+      scriptProcessor.connect(audioContext.destination);
 
       scriptProcessor.onaudioprocess = (e) => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-        const input = e.inputBuffer.getChannelData(0);
+        const inputData = e.inputBuffer.getChannelData(0);
 
-        // Calculate RMS frame energy
+        // 1. Calculate RMS frame energy for live meter & barge-in
         let sum = 0;
-        for (let i = 0; i < input.length; i++) {
-          sum += input[i] * input[i];
+        for (let i = 0; i < inputData.length; i++) {
+          sum += inputData[i] * inputData[i];
         }
-        const rms = Math.sqrt(sum / input.length);
+        const rms = Math.sqrt(sum / inputData.length);
+
+        // Update live mic meter bar
+        const meterPct = Math.min(100, Math.round(rms * 100 * 3));
+        if (micMeterBar) micMeterBar.style.width = `${meterPct}%`;
+        if (micMeterValue) micMeterValue.textContent = `${meterPct}%`;
 
         // Barge-in detection while state is SPEAKING
         if (currentState === "speaking" && rms > 0.04) {
@@ -196,17 +235,64 @@ btnStart.addEventListener("click", async () => {
           consecutiveSpeechFrames = 0;
         }
 
-        // Downsample/convert Float32 to Int16 PCM (16kHz mono)
-        const pcm16 = new Int16Array(input.length);
-        for (let i = 0; i < input.length; i++) {
-          let s = Math.max(-1, Math.min(1, input[i]));
-          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-        }
-        ws.send(pcm16.buffer);
-      };
+        // 2. Resample from inSampleRate to 16,000 Hz with continuous phase tracking
+        const outSampleRate = 16000;
+        const ratio = inSampleRate / outSampleRate;
 
-      source.connect(scriptProcessor);
-      scriptProcessor.connect(audioContext.destination);
+        // Concatenate previous unprocessed input samples with new buffer
+        const totalInput = new Float32Array(inputCarry.length + inputData.length);
+        totalInput.set(inputCarry);
+        totalInput.set(inputData, inputCarry.length);
+
+        // Linear interpolation with zero-drift carry-over
+        const resampled = [];
+        while (resamplePos + 1 < totalInput.length) {
+          const idx = Math.floor(resamplePos);
+          const frac = resamplePos - idx;
+          const s0 = totalInput[idx];
+          const s1 = totalInput[idx + 1];
+          resampled.push(s0 + frac * (s1 - s0));
+          resamplePos += ratio;
+        }
+
+        // Keep unprocessed samples and maintain fractional offset
+        const lastProcessedIdx = Math.floor(resamplePos);
+        inputCarry = totalInput.slice(lastProcessedIdx);
+        resamplePos -= lastProcessedIdx;
+
+        // 3. Accumulate into output carry-over buffer
+        const combinedOutput = new Float32Array(outputCarry.length + resampled.length);
+        combinedOutput.set(outputCarry);
+        combinedOutput.set(resampled, outputCarry.length);
+        outputCarry = combinedOutput;
+
+        // 4. Emit strictly 320-sample (640-byte = 20ms) 16kHz mono s16le frames
+        const FRAME_SAMPLES = 320; // 20 ms at 16 kHz
+        while (outputCarry.length >= FRAME_SAMPLES) {
+          const frameSlice = outputCarry.subarray(0, FRAME_SAMPLES);
+          outputCarry = outputCarry.slice(FRAME_SAMPLES);
+
+          const pcm16 = new Int16Array(FRAME_SAMPLES);
+          for (let i = 0; i < FRAME_SAMPLES; i++) {
+            // Clip to [-1.0, 1.0] and scale correctly by (x * 32767)
+            const s = Math.max(-1.0, Math.min(1.0, frameSlice[i]));
+            pcm16[i] = Math.round(s * 32767);
+          }
+
+          ws.send(pcm16.buffer);
+          framesSentCount++;
+        }
+
+        // 5. Update debug line FPS
+        const now = performance.now();
+        if (now - lastFpsTimestamp >= 1000) {
+          const fps = ((framesSentCount * 1000) / (now - lastFpsTimestamp)).toFixed(1);
+          if (dbgFps) dbgFps.textContent = fps;
+          if (dbgBytesPerFrame) dbgBytesPerFrame.textContent = "640";
+          framesSentCount = 0;
+          lastFpsTimestamp = now;
+        }
+      };
 
       // Ping keepalive every 15s
       pingInterval = setInterval(() => {
@@ -276,7 +362,21 @@ function cleanup() {
   stopAllPlayback();
   if (micStream) micStream.getTracks().forEach((t) => t.stop());
   if (scriptProcessor) scriptProcessor.disconnect();
+  if (biquadFilter) {
+    try { biquadFilter.disconnect(); } catch (_) {}
+    biquadFilter = null;
+  }
   if (audioContext && audioContext.state !== "closed") audioContext.close();
+
+  inputCarry = new Float32Array(0);
+  outputCarry = new Float32Array(0);
+  resamplePos = 0.0;
+  framesSentCount = 0;
+
+  if (micMeterBar) micMeterBar.style.width = "0%";
+  if (micMeterValue) micMeterValue.textContent = "0%";
+  if (dbgFps) dbgFps.textContent = "0.0";
+
   btnStart.disabled = false;
   btnEnd.disabled = true;
   setStatus("Ended");

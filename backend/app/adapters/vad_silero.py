@@ -53,6 +53,8 @@ class SileroVADProcessor:
         self._session = ort.InferenceSession(str(p), sess_options=opts)
 
         self._sr = np.array(16000, dtype=np.int64)
+        self.last_prob: float = 0.0
+        self.max_prob: float = 0.0
         self.reset()
 
     def reset(self) -> None:
@@ -63,6 +65,14 @@ class SileroVADProcessor:
         self._is_speaking = False
         self._consecutive_silence_samples = 0
         self._speech_samples = 0
+        self.last_prob = 0.0
+        self.max_prob = 0.0
+
+    def get_and_reset_max_prob(self) -> float:
+        """Return the maximum speech probability since last call and reset it."""
+        p = self.max_prob
+        self.max_prob = self.last_prob
+        return p
 
     def process(self, frame: bytes) -> Optional[VADEvent]:
         """Process incoming 16kHz s16le PCM frame and emit SPEECH_START / SPEECH_END."""
@@ -97,6 +107,9 @@ class SileroVADProcessor:
             self._context = window[-64:]
 
             prob = float(out[0][0])
+            self.last_prob = prob
+            if prob > self.max_prob:
+                self.max_prob = prob
             is_speech_window = prob >= self.threshold
 
             if not self._is_speaking:

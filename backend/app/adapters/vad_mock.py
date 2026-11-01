@@ -18,10 +18,20 @@ class MockVADProcessor:
     def __init__(self, energy_threshold: float = 500.0) -> None:
         self.energy_threshold: float = energy_threshold
         self.is_speech: bool = False
+        self.last_prob: float = 0.0
+        self.max_prob: float = 0.0
 
     def reset(self) -> None:
         """Reset internal speech state."""
         self.is_speech = False
+        self.last_prob = 0.0
+        self.max_prob = 0.0
+
+    def get_and_reset_max_prob(self) -> float:
+        """Return the maximum speech probability since last call and reset it."""
+        p = self.max_prob
+        self.max_prob = self.last_prob
+        return p
 
     def calculate_energy(self, frame: bytes) -> float:
         """Calculate Root Mean Square (RMS) energy for 16-bit mono PCM."""
@@ -36,6 +46,10 @@ class MockVADProcessor:
         """Process a PCM frame and emit SPEECH_START or SPEECH_END on state changes."""
         rms = self.calculate_energy(frame)
         speech_detected = rms >= self.energy_threshold
+        prob = 1.0 if speech_detected else 0.0
+        self.last_prob = prob
+        if prob > self.max_prob:
+            self.max_prob = prob
 
         if speech_detected and not self.is_speech:
             self.is_speech = True
