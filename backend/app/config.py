@@ -24,7 +24,12 @@ class Settings(BaseSettings):
     )
 
     # System & Prompt Configuration
-    SYSTEM_PROMPT: str = "You are a helpful voice assistant."
+    SYSTEM_PROMPT: str = (
+        "You are a helpful voice assistant. For any question about the current time or date, "
+        "ALWAYS call the get_current_time tool (if no place is given, use timezone 'Asia/Kolkata'). "
+        "Never say you have no timezone or cannot check the time. "
+        "Keep answers concise, direct, and strictly limited to 1-2 short sentences without markdown formatting."
+    )
     PROMPT_VERSION: str = "v1.0"
     FALLBACK_LINE: str = "Sorry, I didn't catch that, could you repeat?"
 
@@ -56,7 +61,7 @@ class Settings(BaseSettings):
 
     # Model Paths
     SILERO_MODEL_PATH: str = "models/silero_vad.onnx"
-    VOSK_MODEL_PATH: str = "models/vosk-model-small-en-us-0.15"
+    VOSK_MODEL_PATH: str = "models/vosk-model-en-us-0.22-lgraph"
     PIPER_MODEL_PATH: str = "models/en_US-lessac-medium.onnx"
 
     # Persistence & Server Configuration

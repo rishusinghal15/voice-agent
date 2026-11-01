@@ -74,9 +74,11 @@ async def test_vosk_stt_cancellation():
 
 def test_vosk_real_model_loading():
     """Verify real Vosk model loads and initializes stream if directory exists."""
-    model_dir = Path("models/vosk-model-small-en-us-0.15")
+    model_dir = Path("models/vosk-model-en-us-0.22-lgraph")
     if not model_dir.is_dir():
-        pytest.skip("models/vosk-model-small-en-us-0.15 not found")
+        model_dir = Path("models/vosk-model-small-en-us-0.15")
+    if not model_dir.is_dir():
+        pytest.skip("No Vosk model directory found")
 
     adapter = VoskSTTAdapter(model_path=str(model_dir))
     assert adapter.model_path == str(model_dir)

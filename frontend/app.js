@@ -1,5 +1,11 @@
 // Voice Agent client application with real-time Web Audio, barge-in detection, and live captions.
 
+// Barge-in Configuration Constants
+const BARGE_IN_GRACE_PERIOD_MS = 600;       // Only monitor after playback started for >= 600 ms
+const BARGE_IN_MIN_RMS = 0.06;              // Minimum fixed RMS threshold
+const BARGE_IN_NOISE_MULTIPLIER = 3.0;      // Adaptive noise floor multiplier (noise floor x 3)
+const BARGE_IN_SUSTAIN_MS = 250;            // Require RMS above threshold sustained for >= 250 ms
+
 let sessionId = null;
 let ws = null;
 let audioContext = null;
@@ -9,11 +15,12 @@ let pingInterval = null;
 
 let currentState = "idle";
 let currentTurnId = null;
-let currentSampleRate = 24000;
+let currentSampleRate = 22050;
 let nextPlayTime = 0;
 let speechPlaybackStartTime = 0;
 let activeAudioSources = [];
-let consecutiveSpeechFrames = 0;
+let sustainedSpeechMs = 0;
+let noiseFloorRMS = 0.01;
 let playbackDoneTimer = null;
 let partialCaptionEl = null;
 
@@ -70,6 +77,7 @@ function commitUserCaption(text) {
 }
 
 function stopAllPlayback() {
+  console.log(`[Playback] stopAllPlayback called, stopping ${activeAudioSources.length} active sources`);
   for (const src of activeAudioSources) {
     try {
       src.stop();
@@ -80,6 +88,7 @@ function stopAllPlayback() {
   if (audioContext) {
     nextPlayTime = audioContext.currentTime;
   }
+  speechPlaybackStartTime = 0;
   if (playbackDoneTimer) {
     clearTimeout(playbackDoneTimer);
     playbackDoneTimer = null;
@@ -107,9 +116,13 @@ function scheduleAudioChunk(arrayBuffer) {
   const now = audioContext.currentTime;
   if (nextPlayTime < now) {
     nextPlayTime = now;
-    speechPlaybackStartTime = now;
+  }
+  if (speechPlaybackStartTime === 0) {
+    speechPlaybackStartTime = nextPlayTime;
+    console.log(`[Playback] Speech playback starting at time=${speechPlaybackStartTime.toFixed(3)}s`);
   }
 
+  console.log(`[Playback] Audio chunk scheduled: ${arrayBuffer.byteLength} bytes at ${nextPlayTime.toFixed(3)}s (audioContext.currentTime=${now.toFixed(3)}s, duration=${audioBuffer.duration.toFixed(3)}s)`);
   source.start(nextPlayTime);
   nextPlayTime += audioBuffer.duration;
   activeAudioSources.push(source);
@@ -134,6 +147,8 @@ function schedulePlaybackDone(turnId) {
 
   playbackDoneTimer = setTimeout(() => {
     if (ws && ws.readyState === WebSocket.OPEN && currentState === "speaking") {
+      console.log(`[Playback] Speech playback completed for turn ${turnId}`);
+      speechPlaybackStartTime = 0;
       ws.send(JSON.stringify({
         type: "playback_done",
         turn_id: turnId,
@@ -175,6 +190,9 @@ btnStart.addEventListener("click", async () => {
 
       // Setup audio capture, anti-aliasing low-pass, 16kHz resampling, and live meter
       audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioContext.state === "suspended") {
+        audioContext.resume().catch((err) => console.warn("AudioContext resume warning:", err));
+      }
       const inSampleRate = audioContext.sampleRate;
       if (dbgSampleRate) dbgSampleRate.textContent = inSampleRate;
       if (dbgBytesPerFrame) dbgBytesPerFrame.textContent = "640";
@@ -185,6 +203,8 @@ btnStart.addEventListener("click", async () => {
       outputCarry = new Float32Array(0);
       framesSentCount = 0;
       lastFpsTimestamp = performance.now();
+      sustainedSpeechMs = 0;
+      noiseFloorRMS = 0.01;
 
       // Create hardware anti-aliasing lowpass filter (cutoff 7500 Hz for 16 kHz Nyquist at 8000 Hz)
       biquadFilter = audioContext.createBiquadFilter();
@@ -204,6 +224,7 @@ btnStart.addEventListener("click", async () => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
         const inputData = e.inputBuffer.getChannelData(0);
+        const bufferDurationMs = (inputData.length / audioContext.sampleRate) * 1000;
 
         // 1. Calculate RMS frame energy for live meter & barge-in
         let sum = 0;
@@ -217,22 +238,43 @@ btnStart.addEventListener("click", async () => {
         if (micMeterBar) micMeterBar.style.width = `${meterPct}%`;
         if (micMeterValue) micMeterValue.textContent = `${meterPct}%`;
 
-        // Barge-in detection while state is SPEAKING
-        if (currentState === "speaking" && rms > 0.04) {
-          consecutiveSpeechFrames++;
-          if (consecutiveSpeechFrames >= 3) { // ~150ms speech detected
-            stopAllPlayback();
-            const playedMs = Math.max(0, (audioContext.currentTime - speechPlaybackStartTime) * 1000);
-            ws.send(JSON.stringify({
-              type: "interrupt",
-              turn_id: currentTurnId,
-              played_ms: Math.round(playedMs),
-            }));
-            consecutiveSpeechFrames = 0;
-            logMessage("[Barge-in] Interrupted agent speech.", "system");
+        // Measure background noise floor during LISTENING
+        if (currentState === "listening") {
+          noiseFloorRMS = 0.95 * noiseFloorRMS + 0.05 * rms;
+        }
+
+        // Adaptive barge-in threshold (noise floor x 3, minimum fixed value BARGE_IN_MIN_RMS)
+        const currentBargeInThreshold = Math.max(BARGE_IN_MIN_RMS, noiseFloorRMS * BARGE_IN_NOISE_MULTIPLIER);
+
+        // Barge-in detection:
+        // (a) Only monitor while state is speaking AND at least 600 ms after playback started
+        // (b) Require RMS above adaptive threshold sustained for at least 250 ms
+        const playbackElapsedMs = speechPlaybackStartTime > 0 ? (audioContext.currentTime - speechPlaybackStartTime) * 1000 : 0;
+        const isPlaybackActive = activeAudioSources.length > 0 && speechPlaybackStartTime > 0;
+
+        if (currentState === "speaking" && isPlaybackActive && playbackElapsedMs >= BARGE_IN_GRACE_PERIOD_MS) {
+          if (rms >= currentBargeInThreshold) {
+            sustainedSpeechMs += bufferDurationMs;
+            if (sustainedSpeechMs >= BARGE_IN_SUSTAIN_MS) {
+              console.log(
+                `[Barge-in] Triggered! RMS: ${rms.toFixed(4)}, Threshold: ${currentBargeInThreshold.toFixed(4)}, ` +
+                `Sustained: ${sustainedSpeechMs.toFixed(0)}ms, PlaybackElapsed: ${playbackElapsedMs.toFixed(0)}ms`
+              );
+              stopAllPlayback();
+              const playedMs = Math.max(0, (audioContext.currentTime - speechPlaybackStartTime) * 1000);
+              ws.send(JSON.stringify({
+                type: "interrupt",
+                turn_id: currentTurnId,
+                played_ms: Math.round(playedMs),
+              }));
+              sustainedSpeechMs = 0;
+              logMessage("[Barge-in] Interrupted agent speech.", "system");
+            }
+          } else {
+            sustainedSpeechMs = 0;
           }
         } else {
-          consecutiveSpeechFrames = 0;
+          sustainedSpeechMs = 0;
         }
 
         // 2. Resample from inSampleRate to 16,000 Hz with continuous phase tracking
@@ -316,8 +358,10 @@ btnStart.addEventListener("click", async () => {
         } else if (msg.type === "agent_text") {
           logMessage(`Agent: ${msg.text}`, "agent");
         } else if (msg.type === "agent_audio_start") {
+          console.log("[Audio] agent_audio_start:", msg);
           currentTurnId = msg.turn_id;
-          currentSampleRate = msg.sample_rate || 24000;
+          currentSampleRate = msg.sample_rate || 22050;
+          speechPlaybackStartTime = 0;
         } else if (msg.type === "turn_done") {
           schedulePlaybackDone(msg.turn_id);
         } else if (msg.type === "tool_event") {
@@ -330,6 +374,7 @@ btnStart.addEventListener("click", async () => {
         }
       } else {
         // Binary PCM chunk received from agent TTS
+        console.log(`[Audio] Received audio chunk: ${event.data.byteLength} bytes`);
         scheduleAudioChunk(event.data);
       }
     };
@@ -372,6 +417,9 @@ function cleanup() {
   outputCarry = new Float32Array(0);
   resamplePos = 0.0;
   framesSentCount = 0;
+  sustainedSpeechMs = 0;
+  noiseFloorRMS = 0.01;
+  speechPlaybackStartTime = 0;
 
   if (micMeterBar) micMeterBar.style.width = "0%";
   if (micMeterValue) micMeterValue.textContent = "0%";

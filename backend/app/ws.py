@@ -20,6 +20,12 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
+try:
+    from uvicorn.protocols.utils import ClientDisconnected
+except ImportError:
+    class ClientDisconnected(Exception):
+        pass
+
 from backend.app import db
 from backend.app.pipeline import VoicePipeline
 from backend.app.session import Session, SessionEvent, SessionState
@@ -37,7 +43,11 @@ async def send_json_message(websocket: WebSocket, payload: Dict[str, Any]) -> No
     """Send a JSON text frame ensuring 'ts' (epoch ms) is included."""
     if "ts" not in payload:
         payload["ts"] = current_epoch_ms()
-    await websocket.send_text(json.dumps(payload))
+    try:
+        await websocket.send_text(json.dumps(payload))
+    except (WebSocketDisconnect, ClientDisconnected):
+        logger.info("[WS Voice] Client disconnected during send_json_message")
+        raise
 
 
 @router.websocket("/ws/voice")
@@ -174,8 +184,10 @@ async def websocket_voice_endpoint(
                         await db.end_session(session_id=session_id, end_reason="user_end")
                         await websocket.close()
                         return
-        except WebSocketDisconnect:
-            pass
+        except (WebSocketDisconnect, ClientDisconnected):
+            logger.info(
+                f"[WS Voice] Client disconnected in echo mode for session_id={session_id}"
+            )
         finally:
             if session.state != SessionState.ENDED:
                 try:
@@ -186,10 +198,19 @@ async def websocket_voice_endpoint(
         return
 
     # Real-time Voice Pipeline mode (default)
+    async def _emit_audio(chunk: bytes) -> None:
+        try:
+            await websocket.send_bytes(chunk)
+        except (WebSocketDisconnect, ClientDisconnected):
+            logger.info(
+                f"[WS Voice] Client disconnected in emit_audio for session_id={session_id}"
+            )
+            raise
+
     pipeline = VoicePipeline(
         session_id=session_id,
         emit_json=lambda payload: send_json_message(websocket, payload),
-        emit_audio=lambda chunk: websocket.send_bytes(chunk),
+        emit_audio=_emit_audio,
     )
     await pipeline.start()
 
@@ -249,8 +270,8 @@ async def websocket_voice_endpoint(
                     await websocket.close()
                     return
 
-    except WebSocketDisconnect:
-        pass
+    except (WebSocketDisconnect, ClientDisconnected):
+        logger.info(f"[WS Voice] Client disconnected for session_id={session_id}")
     except Exception as exc:
         logger.error(
             f"[WS Voice] Exception in websocket handler for session_id={session_id}: {exc}\n"

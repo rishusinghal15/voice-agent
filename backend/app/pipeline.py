@@ -25,6 +25,14 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from fastapi import WebSocketDisconnect
+
+try:
+    from uvicorn.protocols.utils import ClientDisconnected
+except ImportError:
+    class ClientDisconnected(Exception):
+        pass
+
 from backend.app import db
 from backend.app.adapters.protocols import (
     Done,
@@ -128,6 +136,11 @@ class VoicePipeline:
         try:
             return await coro
         except asyncio.CancelledError:
+            raise
+        except (WebSocketDisconnect, ClientDisconnected):
+            logger.info(
+                f"[Session {self.session_id}] Client disconnected during background task '{name}'"
+            )
             raise
         except Exception as exc:
             logger.error(
@@ -338,6 +351,10 @@ class VoicePipeline:
                     await self.final_transcript_queue.put(event.text)
         except asyncio.CancelledError:
             pass
+        except (WebSocketDisconnect, ClientDisconnected):
+            logger.info(
+                f"[Session {self.session_id}] Client disconnected during STT consumption"
+            )
         except Exception as exc:
             logger.error(f"[Session {self.session_id}] Exception in STT event stream: {exc}\n{traceback.format_exc()}")
             await self.final_transcript_queue.put("")
@@ -402,6 +419,11 @@ class VoicePipeline:
             # 2. LLM streaming and TTS synthesis
             await self._stream_llm_and_tts()
 
+        except (WebSocketDisconnect, ClientDisconnected):
+            logger.info(
+                f"[Session {self.session_id}] Client disconnected during turn execution"
+            )
+            raise
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -431,10 +453,12 @@ class VoicePipeline:
         while True:
             tool_call_to_run: Optional[ToolCall] = None
             first_token_received = False
+            first_event_received = asyncio.Event()
 
             async def _run_llm_stream() -> None:
                 nonlocal tool_call_to_run, first_token_stamped, first_sentence_stamped, sentence_index, first_token_received
                 async for event in self.llm.stream(messages, tools):
+                    first_event_received.set()
                     if isinstance(event, ToolCall):
                         tool_call_to_run = event
                         break
@@ -443,6 +467,14 @@ class VoicePipeline:
                         if not first_token_stamped:
                             self.turn_timer.mark_llm_first_token()
                             first_token_stamped = True
+                            llm_ft_ms = (
+                                (time.monotonic() - self.turn_timer.t_stt_final) * 1000.0
+                                if self.turn_timer.t_stt_final
+                                else 0.0
+                            )
+                            logger.info(
+                                f"[Session {self.session_id}] LLM first token received in {llm_ft_ms:.2f} ms"
+                            )
                         self.current_agent_text.append(event.text)
                         for sentence in sb.feed(event.text):
                             await self._synthesize_and_send_sentence(
@@ -455,19 +487,38 @@ class VoicePipeline:
                     elif isinstance(event, Done):
                         pass
 
+            llm_task = asyncio.create_task(_run_llm_stream())
             try:
-                # Apply LLM timeout
+                # Apply design §4 & §9 first-token timeout (5.0s)
                 await asyncio.wait_for(
-                    _run_llm_stream(),
+                    first_event_received.wait(),
                     timeout=settings.LLM_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
+                llm_task.cancel()
                 await self._handle_turn_error(
                     stage="llm",
                     code="LLM_ERROR",
-                    message=f"LLM timed out after {settings.LLM_TIMEOUT_S}s",
+                    message=f"LLM first token timed out after {settings.LLM_TIMEOUT_S}s",
                 )
                 return
+            except Exception as exc:
+                llm_task.cancel()
+                await self._handle_turn_error(
+                    stage="llm",
+                    code="LLM_ERROR",
+                    message=f"LLM streaming error: {exc}",
+                )
+                return
+
+            # Await completion of LLM stream and sentence synthesis
+            try:
+                await asyncio.wait_for(llm_task, timeout=15.0)
+            except asyncio.TimeoutError:
+                llm_task.cancel()
+                logger.warning(
+                    f"[Session {self.session_id}] Full LLM streaming exceeded 15s limit, continuing."
+                )
             except Exception as exc:
                 await self._handle_turn_error(
                     stage="llm",
@@ -583,6 +634,11 @@ class VoicePipeline:
                     self.turn_timer.mark_tts_first_audio()
                 sentence_bytes += len(chunk)
                 await self.emit_audio(chunk)
+        except (WebSocketDisconnect, ClientDisconnected):
+            logger.info(
+                f"[Session {self.session_id}] Client disconnected during TTS audio send"
+            )
+            raise
         except Exception as exc:
             # TTS failure: log error and notify client
             await db.write_error(
@@ -802,8 +858,48 @@ class VoicePipeline:
         if self.stt_events_task and not self.stt_events_task.done():
             self.stt_events_task.cancel()
 
+        # Persist uncommitted agent turn / transcript and metrics once if interrupted by drop
+        full_reply = "".join(self.current_agent_text).strip()
+        if full_reply and (not self.history or self.history[-1].get("role") != "agent"):
+            self.history.append({"role": "agent", "content": full_reply})
+            tool_calls_json = (
+                json.dumps(self.turn_tool_calls) if self.turn_tool_calls else None
+            )
+            try:
+                await db.write_turn(
+                    session_id=self.session_id,
+                    turn_id=self.turn_id,
+                    role="agent",
+                    text=full_reply,
+                    interrupted=1 if reason == "ws_drop" else 0,
+                    tool_calls_json=tool_calls_json,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Session {self.session_id}] Failed to persist turn on close: {e}"
+                )
+
+            if self.turn_timer.t_speech_start is not None:
+                try:
+                    metrics = self.turn_timer.compute()
+                    await db.write_turn_metrics(
+                        session_id=self.session_id,
+                        turn_id=self.turn_id,
+                        vad_end_ms=metrics.vad_end_ms,
+                        stt_final_ms=metrics.stt_final_ms,
+                        llm_first_token_ms=metrics.llm_first_token_ms,
+                        tts_first_audio_ms=metrics.tts_first_audio_ms,
+                        total_ms=metrics.total_ms,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[Session {self.session_id}] Failed to persist metrics on close: {e}"
+                    )
+
         try:
-            self.session.transition(SessionEvent.END_CALL)
+            self.session.transition(
+                SessionEvent.WS_DROP if reason == "ws_drop" else SessionEvent.END_CALL
+            )
         except Exception:
             self.session.state = SessionState.ENDED
 

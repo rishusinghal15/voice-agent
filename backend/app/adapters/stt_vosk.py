@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
+import time
 from typing import AsyncIterator, Optional
 import vosk
 
@@ -22,6 +24,8 @@ from backend.app.adapters.protocols import (
     STTStream,
 )
 from backend.app.config import settings
+
+logger = logging.getLogger("voice_agent.stt_vosk")
 
 # Global cached Vosk model instance to prevent reloading weights on each turn
 _CACHED_VOSK_MODEL: Optional[vosk.Model] = None
@@ -36,13 +40,28 @@ def get_cached_vosk_model(model_path: str) -> vosk.Model:
         if not p.is_dir():
             raise FileNotFoundError(
                 f"Vosk model directory not found at '{model_path}'. "
-                f"Please ensure models/vosk-model-small-en-us-0.15 exists."
+                f"Please ensure '{model_path}' exists."
             )
         # Suppress verbose Vosk log output
         vosk.SetLogLevel(-1)
         _CACHED_VOSK_MODEL = vosk.Model(str(p))
         _CACHED_VOSK_PATH = model_path
     return _CACHED_VOSK_MODEL
+
+
+def warmup_vosk_model(model_path: Optional[str] = None) -> vosk.Model:
+    """Preload and warm up Vosk model outside the event loop."""
+    p = model_path or settings.VOSK_MODEL_PATH
+    t0 = time.time()
+    logger.info(f"[Vosk STT] Preloading and warming up model from '{p}'...")
+    model = get_cached_vosk_model(p)
+    # Warm up Kaldi recognizer with a dummy frame
+    rec = vosk.KaldiRecognizer(model, 16000)
+    rec.AcceptWaveform(b"\x00" * 320)
+    rec.FinalResult()
+    load_time_ms = (time.time() - t0) * 1000.0
+    logger.info(f"[Vosk STT] Model '{p}' successfully loaded and warmed up in {load_time_ms:.1f} ms")
+    return model
 
 
 class VoskSTTStream:

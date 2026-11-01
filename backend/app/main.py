@@ -57,7 +57,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log_startup_providers()
     # Initialize SQLite database tables on startup
     await init_db(settings.DB_PATH)
+    # Warm up Vosk STT model in worker thread if active
+    if settings.STT_PROVIDER.lower() == "vosk":
+        import asyncio
+        from backend.app.adapters.stt_vosk import warmup_vosk_model
+        await asyncio.to_thread(warmup_vosk_model)
+    # Warm up persistent Groq client if active
+    if settings.LLM_PROVIDER.lower() == "groq":
+        from backend.app.adapters.llm_groq import get_groq_client
+        get_groq_client()
     yield
+    # Shutdown hooks
+    from backend.app.adapters.llm_groq import close_groq_client
+    await close_groq_client()
 
 
 app = FastAPI(
